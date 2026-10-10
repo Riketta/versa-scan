@@ -128,7 +128,7 @@ impl BatchPlanner {
                     _ => None,
                 };
                 let mut batch = restored.unwrap_or_else(|| self.fresh_batch(request.priority));
-                self.try_add(&mut batch, request, &mut event);
+                Self::try_add(&mut batch, request, &mut event);
                 self.seal_if_full(batch, &mut event);
             }
             Some(open) => {
@@ -137,18 +137,18 @@ impl BatchPlanner {
                     self.next_seq += 1;
                     self.parked.push(Parked { batch: open, seq: self.next_seq });
                     let mut batch = self.fresh_batch(request.priority);
-                    self.try_add(&mut batch, request, &mut event);
+                    Self::try_add(&mut batch, request, &mut event);
                     self.open = Some(batch);
                 } else if open.priority() > request.priority {
                     // Close the open batch so the lower-priority request gets
                     // its own batch instead of waiting behind a scan.
                     event.ready.push(open);
                     let mut batch = self.fresh_batch(request.priority);
-                    self.try_add(&mut batch, request, &mut event);
+                    Self::try_add(&mut batch, request, &mut event);
                     self.seal_if_full(batch, &mut event);
                 } else {
                     let mut batch = open;
-                    if self.try_add(&mut batch, request, &mut event) && batch.is_full() {
+                    if Self::try_add(&mut batch, request, &mut event) && batch.is_full() {
                         event.ready.push(batch);
                     } else {
                         self.open = Some(batch);
@@ -173,12 +173,7 @@ impl BatchPlanner {
     }
 
     /// Returns true when the request was added.
-    fn try_add(
-        &self,
-        batch: &mut ScanBatch,
-        request: SampleRequest,
-        event: &mut PlannerEvent,
-    ) -> bool {
+    fn try_add(batch: &mut ScanBatch, request: SampleRequest, event: &mut PlannerEvent) -> bool {
         match batch.try_add(request) {
             Ok(()) => true,
             Err(err) => {

@@ -7,7 +7,7 @@
 
 use crate::models::batch::BatchFile;
 use crate::models::verdict::FileVerdict;
-use crate::ports::ScanOutput;
+use crate::ports::driven::ScanOutput;
 
 /// One validated file: what the scanner said (or a synthesized error).
 #[derive(Debug, Clone, PartialEq)]

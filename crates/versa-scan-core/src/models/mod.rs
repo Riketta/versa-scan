@@ -33,5 +33,6 @@ pub use verdict::Detection;
 pub use verdict::FileVerdict;
 pub use verdict::ScanOutcome;
 pub use verdict::SkipReason;
+pub use worker::UnknownRole;
 pub use worker::WorkerInfo;
 pub use worker::WorkerRole;

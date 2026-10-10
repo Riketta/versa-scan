@@ -26,6 +26,7 @@ config = { version = "0.15.25", default-features = false, features = [
 ] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 lapin = "3.0"
+parking_lot = "0.12.5"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",

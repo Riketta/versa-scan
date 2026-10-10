@@ -8,14 +8,24 @@ license.workspace = true
 [dependencies]
 versa-scan-core.workspace = true
 
+async-nats.workspace = true
+async-trait.workspace = true
 config.workspace = true
+futures-util.workspace = true
 hostname = "0.4"
+lapin.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
 
 [lints]
 workspace = true

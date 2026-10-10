@@ -14,7 +14,7 @@ and code disagree after implementation starts, fix the doc.
 | # | Topic | Decision |
 |---|-------|----------|
 | D1 | Architecture | Hexagonal (ports & adapters), **no** micro-kernel (no plugin cardinality exists here). Core has zero infra deps, enforced by workspace crate split. |
-| D2 | Bus | `BusPort` (work-queue semantics: ack/nak/requeue, best-effort priority). Two adapters: RabbitMQ (`lapin`), NATS JetStream (`async-nats`). Plus in-memory for tests. |
+| D2 | Bus | Work-queue bus behind split ports: driving `ScanPipelinePort` (listener → pipeline ingest) + driven `RequestPublisherPort`/`ReportPublisherPort`. Adapters: RabbitMQ (`lapin`), NATS JetStream (`async-nats`), in-memory. |
 | D3 | Scanners v1 | Open & generic first: `clamd` (TCP), `defender` (MpCmdRun), `debug` (deterministic, for tests). Commercial AVs (KES, DrWeb, NOD32, ...) ported incrementally later. |
 | D4 | Artifact store | No existing backend. Address fully configurable. `vscli` embeds its own artifact storage + HTTP server (content-addressed by sha256). |
 | D5 | Wire contract | Own endpoints/schemas designed fresh (see below), versioned, not backwards compatible with the C# system. |
@@ -57,12 +57,16 @@ versa-scan/
 │   │                             #   reporter, validation, update_loop
 │   ├── versa-scan-infra/         # Adapters. Depends on core. All blocking work
 │   │   └── src/                  #   through tokio; process-spawn via tokio::process.
-│   │       ├── bus/              # wire.rs (DTOs), rabbitmq.rs, nats.rs, in_memory.rs
-│   │       ├── scanners/         # mod.rs (registry), clamd.rs, defender.rs, debug.rs
-│   │       ├── fetch/            # http.rs (reqwest streaming + hash verify)
-│   │       ├── process/          # tree-kill (Windows taskkill /T, POSIX group)
-│   │       ├── self_update/      # manifest.rs, swap.rs (rename-swap on Windows)
-│   │       ├── scheduler.rs      # tokio interval, versa-bot scheduler contract
+│   │       ├── inbound_adapters/ # DRIVING edge: bus listeners feed ScanPipelinePort
+│   │       │   └── bus/          #   rabbitmq.rs, nats.rs, in_memory.rs
+│   │       ├── outbound_adapters/ # DRIVEN edge: what the core calls out to
+│   │       │   ├── bus/          #   rabbitmq.rs, nats.rs, in_memory.rs (publishers)
+│   │       │   ├── scanners/     #   clamd.rs, defender.rs, debug.rs
+│   │       │   ├── fetch/        #   http.rs (reqwest streaming + hash verify)
+│   │       │   ├── process/      #   tree-kill (Windows taskkill /T, POSIX group)
+│   │       │   ├── self_update/  #   manifest.rs, swap.rs (rename-swap on Windows)
+│   │       │   └── scheduler.rs
+│   │       ├── wire.rs           # schema-versioned DTOs + topology naming (shared)
 │   │       ├── config.rs         # TOML + env, loaded once (no hot reload by design)
 │   │       └── observability.rs  # tracing setup (+ optional syslog)
 │   └── (test-support shared fakes live in infra under #[cfg(test)] + a small
@@ -104,7 +108,28 @@ wire-format knowledge.
 
 ## Core: ports
 
+Direction split (hexagonal, versa-bot convention):
+
+**Driving (inbound) - adapters call the core:**
+
 ```rust
+// ports/driving/scan_pipeline.rs
+pub trait ScanPipelinePort: Send + Sync + 'static {
+    /// Listener feeds one delivery; settlement happens later via the
+    /// delivery handle (publish-then-ack is a core invariant).
+    fn ingest(self: Arc<Self>, delivery: Delivery);
+    /// The inbound stream ended (broker disconnect); pipeline flushes and
+    /// requeues unsettled deliveries.
+    fn stream_ended(&self);
+}
+// Delivery { request, attempt, handle: Arc<dyn DeliveryHandle> }
+// DeliveryHandle: ack() | nak_requeue() | discard()
+```
+
+**Driven (outbound) - the core calls adapters:**
+
+```rust
+// ports/driven/scanner.rs
 #[async_trait]
 pub trait ScannerPort: Send + Sync {
     fn id(&self) -> ScannerId;
@@ -114,23 +139,26 @@ pub trait ScannerPort: Send + Sync {
     async fn update(&self) -> Result<UpdateOutcome, ScannerError>;
 }
 
-pub trait BusPort: Send + Sync {
-    async fn consume_requests(&self, scanner: ScannerId) -> Result<RequestStream, BusError>;
-    async fn publish_report(&self, report: &ScanReport, dest: &ReportDest) -> Result<(), BusError>;
+// ports/driven/request_publisher.rs / report_publisher.rs
+#[async_trait]
+pub trait RequestPublisherPort: Send + Sync {
+    async fn publish_request(&self, scanner: ScannerId, request: &SampleRequest) -> Result<(), PublishError>;
+}
+#[async_trait]
+pub trait ReportPublisherPort: Send + Sync {
+    async fn publish_report(&self, report: &ScanReport, dest: &ReportDest) -> Result<(), PublishError>;
 }
 
-// RequestStream yields Delivery { request: SampleRequest, handle: DeliveryHandle }
-// DeliveryHandle: ack() | nak_requeue() | drop()   — retry COUNTING lives in core
+// ports/driven/fetch.rs
 #[async_trait]
 pub trait SampleFetcherPort: Send + Sync {
-    async fn fetch(&self, req: &SampleRequest, dest: &Path) -> Result<FetchedFile, FetchError>;
+    async fn fetch(&self, request: &SampleRequest, dest: &Path) -> Result<FetchedFile, FetchError>;
 }
 
 pub trait SchedulerPort { /* versa-bot shape: interval jobs, cancel handles */ }
+pub trait SelfUpdatePort { async fn check(...) -> Option<Update>; async fn apply(...); }
 // No ConfigPort: config is deployment-static (loaded once at startup) and
 // flows into core as plain value structs (OrchestratorSettings, WorkerInfo).
-// versa-bot needed a hot-reload port; versa-scan deliberately does not.
-pub trait SelfUpdatePort { async fn check(&self) -> Result<Option<Update>, ...>; async fn apply(&self, &Update) -> ...; }
 ```
 
 ## Core: services (the extracted brains of the C# worker)
@@ -160,7 +188,9 @@ pub trait SelfUpdatePort { async fn check(&self) -> Result<Option<Update>, ...>;
 
 ## Wire contract (v1)
 
-JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps.
+JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps. DTOs live in
+`infra::wire`; topology naming (`request_queue_name`,
+`REPORTS_SUBJECT_ROOT`) lives there too.
 
 **`SampleRequestV1`** (published by vscli):
 ```json
@@ -207,23 +237,23 @@ JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps.
   queue before publishing requests (contract: publishing to an undeclared queue
   is a dropped message — requester owns declaration).
 - Redelivery: `nak_requeue` at most once (`attempt` carried in report; terminal
-  failure = error report + ack).
+  failure = error report + ack). Listener + publisher each own a connection/
+  channel; both sides declare the request queue identically.
 
 ### NATS JetStream topology
 
 - Stream `VS_SCAN_REQUESTS`, subject `vs.scan.requests.<scanner>`,
   `WorkQueuePolicy`, `AckExplicit`, duplicates window 2 min,
   `Nats-Msg-Id = <sample_id>` (publish dedupe).
-Durable pull consumers `vs-<scanner>`, `MaxDeliver = 3`,
-  `AckWait` from config. **Priority is a no-op on NATS** (kept simple per
-  review): requests publish to the scanner's single subject regardless of
-  priority; the RMQ adapter honors `x-max-priority`. The `BusPort` itself
-  stays priority-blind — priority lives only in the request DTO.
+- Durable pull consumer `vs-<scanner>` (filter `vs.scan.requests.<scanner>`),
+  `MaxDeliver = 3`, `AckWait` from config. **Priority is a no-op on NATS**
+  (kept simple per review): requests publish to the scanner's single subject
+  regardless of priority; the RMQ adapter honors `x-max-priority`.
 - Reports: stream `VS_SCAN_REPORTS`, subjects `vs.scan.reports.<scanner>.<sample_id>`,
   `LimitsPolicy` + `max_age = 7d`, `Nats-Msg-Id = <sample_id>.<scanner>.<attempt>`
-  (worker-side republish dedupe). `vscli --wait` uses an ephemeral ordered
-  consumer filtered by its sample set; core NATS request-reply NOT used (one
-  uniform JetStream path for both CLI and future collectors).
+  (worker-side republish dedupe). `vscli --wait` uses a plain subscription on its
+  report subject; core NATS request-reply NOT used (one uniform JetStream path
+  for both CLI and future collectors). Settlement: ack / nak / term.
 
 ## vsd (worker daemon)
 
@@ -290,9 +320,11 @@ Durable pull consumers `vs-<scanner>`, `MaxDeliver = 3`,
 - **M1 — Core.** All models, ports, `BatchPlanner`, `RetryPolicy`, `Validation`,
   `WorkspaceManager`, `Orchestrator` against in-memory fakes. *Gate: core unit
   tests comprehensive; `cargo test -p versa-scan-core` is the spec.*
-- **M2 — Bus adapters.** `wire.rs` DTOs + RabbitMQ + NATS adapters + in-memory.
+- **M2 — Bus adapters.** `wire.rs` DTOs + RabbitMQ + NATS listener/publisher
+  adapters + in-memory pair, split by hexagon edge (inbound listeners,
+  outbound publishers).
   *Gate: integration tests over docker brokers pass (priority, ack semantics,
-  dedupe, confirms).*
+  dedupe, confirms, redelivery).*
 - **M3 — Worker.** vsd: clamd + defender + debug scanners, http fetcher,
   scan pipeline e2e, graceful shutdown, cleanup. *Gate: e2e submit→report over
   both buses with debug scanner; clamd IT on Linux.*

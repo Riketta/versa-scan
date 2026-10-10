@@ -52,10 +52,16 @@ dependency changes ship with an updated lockfile.
   pure services. It must never depend on infrastructure - no broker
   client, no HTTP client, no axum, no fs paths beyond `std::path` values
   passed in. The workspace split makes this compile-enforced.
-- `crates/versa-scan-infra` holds every adapter: bus (RabbitMQ / NATS /
-  in-memory), scanners (clamd / defender / debug), HTTP fetcher,
-  process-tree kill, self-update, scheduler, config, observability.
-  Depends on core, never the reverse.
+- `crates/versa-scan-infra` holds every adapter, split by hexagon edge:
+  - `inbound_adapters/` - DRIVING edge, they start the core's work
+    (bus listeners feed `ScanPipelinePort`).
+  - `outbound_adapters/` - DRIVEN edge, they answer the core's needs
+    (bus publishers, scanners, HTTP fetcher, process-tree kill,
+    self-update, scheduler).
+  - `wire.rs` - the bus wire contract (schema-versioned DTOs + topology
+    naming) shared by both bus edges.
+  Plus `config.rs`, `observability.rs` at the root. Depends on core,
+  never the reverse.
 - `bins/vsd` and `bins/vscli` are composition roots: they parse args, load
   config, construct adapters, and wire them into core services. All
   business decisions live in core, never in the bins.
@@ -67,17 +73,23 @@ dependency changes ship with an updated lockfile.
 
 ### Port cardinality
 
-- Service ports (`ScannerPort`, `BusPort`, `SampleFetcherPort`,
-  `SchedulerPort`, `SelfUpdatePort`): one active adapter per worker,
-  chosen and wired at the composition root, injected into core services.
+- Driving port (`ScanPipelinePort`): implemented by the orchestrator;
+  inbound bus listeners ingest deliveries and signal stream ends, never
+  settling deliveries themselves (settlement is a core decision).
+- Driven ports (`ScannerPort`, `RequestPublisherPort`,
+  `ReportPublisherPort`, `SampleFetcherPort`, `SchedulerPort`,
+  `SelfUpdatePort`): one active adapter per process, chosen and wired at
+  the composition root, injected into core services. The bus publisher
+  pair may be one adapter object implementing both publisher ports.
 - There is deliberately NO plugin system and no plugin-to-plugin bus.
 
 ### ACL / models
 
-- Wire DTOs (`SampleRequestV1`, `ScanReportV1`) live in
-  `infra::bus::wire` only. Core models (`SampleRequest`, `ScanReport`,
-  `ScanOutcome`, ...) carry no wire-format knowledge; mapping happens at
-  the boundary. The wire schema is versioned (`schema: 1`).
+- Wire DTOs (`SampleRequestV1`, `ScanReportV1`) live in `infra::wire`
+  only. Core models (`SampleRequest`, `ScanReport`, `ScanOutcome`, ...)
+  carry no wire-format knowledge; mapping happens at the boundary. The
+  wire schema is versioned (`schema: 1`); topology naming
+  (`vs.scan.requests.<scanner>`, `vs.scan.reports.>`) lives there too.
 - `ReportDest` and `ScannerId` are opaque strings to the core: the RMQ
   adapter reads a queue name, the NATS adapter a subject. Priority rides
   in the request DTO; RMQ enforces it with `x-max-priority`, NATS ignores
@@ -113,7 +125,9 @@ reload by design (worker connections are deployment-static).
   modules).
 - Scanner adapters are tested against recorded log/protocol fixtures.
 - Bus adapters get integration tests against real brokers via
-  `docker-compose.yaml` (rabbitmq, nats, clamd) - Linux CI only.
+  `docker-compose.yaml` (rabbitmq, nats, clamd): env-gated by
+  `VERSA_SCAN_TEST_RABBITMQ` / `VERSA_SCAN_TEST_NATS` - set on Linux CI,
+  skipped elsewhere.
 - E2E: `vscli submit --wait` <-> `vsd` with the `debug` scanner over both
   real buses.
 

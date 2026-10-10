@@ -22,6 +22,24 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    services:
+      # Broker integration tests (crates/versa-scan-infra/tests/brokers.rs)
+      # run only where these env vars are set - Linux. Windows skips them.
+      rabbitmq:
+        image: rabbitmq:3.13
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      nats:
+        image: nats:2.11
+        args: ["-js"]
+        ports:
+          - 4222:4222
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8222/healthz"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +53,9 @@ jobs:
         run: cargo +1.98 clippy --all-targets
 
       - name: Tests
+        env:
+          VERSA_SCAN_TEST_RABBITMQ: amqp://guest:guest@localhost:5672/%2f
+          VERSA_SCAN_TEST_NATS: nats://localhost:4222
         run: cargo +1.98 test
 
       - name: Build release binaries

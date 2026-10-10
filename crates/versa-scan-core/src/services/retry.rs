@@ -5,7 +5,7 @@
 //! back to the requester. This replaces the C# system's reject-twice-then-
 //! -vanish behavior and its ack-before-publish loss window.
 
-use crate::ports::FetchError;
+use crate::ports::driven::FetchError;
 
 /// Total delivery attempts allowed per message (first delivery = attempt 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
