@@ -31,10 +31,10 @@ which bus adapter are wired, both chosen at the composition roots.
 ## Status
 
 All milestones (M0-M5) are implemented: core pipeline, RabbitMQ + NATS bus
-adapters, worker (clamd/Defender/debug scanners, HTTP fetcher), CLI
-(store, artifact server, submit --wait), self-updater, openbox role,
-README/Dockerfile/CI. Broker integration tests run on Linux CI (they need
-docker services); everything else runs on both OSes.
+adapters, worker (clamd/YARA-X/hash-blocklist/Defender/debug scanners, HTTP
+fetcher), CLI (store, artifact server, submit --wait), self-updater,
+openbox role, README/Dockerfile/CI. Broker integration tests run on Linux
+CI (they need docker services); everything else runs on both OSes.
 
 ## Layout
 
@@ -122,8 +122,8 @@ vscli reports <sample-id>
 - `--bind` is where the embedded artifact server listens; `--advertise` is
   the URL workers must reach it on (use the host's real IP/hostname behind
   NAT).
-- `--scanner all` fans out to every known scanner (`clamd`, `defender`,
-  `debug`); a slug targets one.
+- `--scanner all` fans out to every known scanner (`clamd`, `yara-x`,
+  `hash-blocklist`, `defender`, `debug`); a slug targets one.
 - `--wait` prints a table (`sample / scanner / outcome`) and exits non-zero
   if any report is missing at the timeout. Reports are persisted to the
   store's `reports/reports.jsonl` regardless.
@@ -133,15 +133,19 @@ vscli reports <sample-id>
 
 ## Scanners
 
-| Slug       | Platform     | Mechanism                                     |
-|------------|--------------|-----------------------------------------------|
-| `clamd`    | any          | clamd TCP protocol (PING/VERSION/INSTREAM); `freshclam` for updates |
-| `defender` | Windows      | `MpCmdRun.exe -Scan` + PowerShell status; `MpCmdRun -SignatureUpdate` for updates |
-| `debug`    | any          | deterministic fake for tests                  |
+| Slug | Platform | Mechanism |
+|----------------|--------------|------------------------------------------------------------------------|
+| `clamd` | any | clamd TCP protocol (PING/VERSION/INSTREAM), parallel streams; `freshclam` for updates |
+| `yara-x` | any | embedded YARA-X engine over your rules (`[yara_x] rules_path`); rules hot-reload on change |
+| `hash-blocklist` | any | sha256 feed matcher (`[hash_blocklist] feeds`); feeds hot-reload on change |
+| `defender` | Windows | `MpCmdRun.exe -Scan` + PowerShell status; `MpCmdRun -SignatureUpdate` for updates |
+| `debug` | any | deterministic fake for tests |
 
-Commercial AVs from the C# system (KES, DrWeb, NOD32, ...) arrive as new
-`ScannerPort` adapters - see `docs/DESIGN.md` for the adapter template
-(fixture-driven parser tests, recorded logs).
+Open/free scanner focus: commercial AVs from the C# system (KES, DrWeb,
+NOD32, ...) are out of scope - new sources arrive as `ScannerPort`
+adapters (see `docs/DESIGN.md` for the adapter template). Useful next
+feeds: abuse.ch MalwareBazaar sha256 exports. The `yara-x` example rule
+set lives in `examples/rules/`.
 
 ## Wire contract
 

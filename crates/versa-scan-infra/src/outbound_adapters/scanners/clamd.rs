@@ -5,6 +5,9 @@
 //! INSTREAM framing: client sends `zINSTREAM\0`, then chunks of
 //! `<u32 big-endian length><bytes>`, terminated by a zero-length chunk; the
 //! daemon answers `stream: OK` or `stream: <detection> FOUND` and closes.
+//! Files are streamed from disk in chunks - never fully buffered - and up
+//! to `[clamd] concurrent_scans` files are in flight at once; every future
+//! carries its own file name so results cannot be mis-attributed.
 //!
 //! Scanner semantics for the orchestrator:
 //! - daemon unreachable / connection dropped mid-scan -> `Unavailable`
@@ -12,10 +15,11 @@
 //! - daemon-reported per-file ERROR -> per-file error verdict (terminal)
 //! - `update()` shells out to `freshclam`
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use versa_scan_core::models::av::AvProfile;
@@ -31,11 +35,12 @@ const CHUNK_SIZE: usize = 32 * 1024;
 
 pub struct ClamdScanner {
     address: String,
+    concurrent_scans: usize,
 }
 
 impl ClamdScanner {
-    pub fn new(address: impl Into<String>) -> Self {
-        Self { address: address.into() }
+    pub fn new(address: impl Into<String>, concurrent_scans: usize) -> Self {
+        Self { address: address.into(), concurrent_scans: concurrent_scans.max(1) }
     }
 
     async fn connect(&self) -> Result<TcpStream, ScannerError> {
@@ -59,11 +64,35 @@ impl ClamdScanner {
             .map_err(|e| ScannerError::Unavailable(format!("clamd {}: {e}", self.address)))
     }
 
-    async fn instream(&self, bytes: &[u8]) -> Result<String, ScannerError> {
-        let mut stream = self.connect().await?;
-        send_instream(&mut stream, bytes)
+    /// Streams one file from disk through INSTREAM without buffering it
+    /// fully in memory. Returns the daemon's response line.
+    async fn instream_file(&self, path: &Path) -> Result<String, ScannerError> {
+        let mut file = tokio::fs::File::open(path)
             .await
-            .map_err(|e| ScannerError::Unavailable(format!("clamd instream: {e}")))
+            .map_err(|e| ScannerError::Io(format!("clamd open {}: {e}", path.display())))?;
+        let unavailable = |e| ScannerError::Unavailable(format!("clamd instream: {e}"));
+        let mut stream = self.connect().await?;
+        stream.write_all(&z("INSTREAM")).await.map_err(unavailable)?;
+
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| ScannerError::Io(format!("clamd read {}: {e}", path.display())))?;
+            if read == 0 {
+                break;
+            }
+            let Some(chunk) = buffer.get(..read) else { continue };
+            stream.write_all(&(read as u32).to_be_bytes()).await.map_err(unavailable)?;
+            stream.write_all(chunk).await.map_err(unavailable)?;
+        }
+        stream.write_all(&0u32.to_be_bytes()).await.map_err(unavailable)?;
+        stream.flush().await.map_err(unavailable)?;
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.map_err(unavailable)?;
+        Ok(response.trim_end().to_owned())
     }
 }
 
@@ -78,23 +107,6 @@ async fn run_command<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     command: &[u8],
 ) -> std::io::Result<String> {
     stream.write_all(command).await?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await?;
-    Ok(response.trim_end().to_owned())
-}
-
-/// Sends one sample through INSTREAM; returns the daemon's response line.
-async fn send_instream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    stream: &mut S,
-    bytes: &[u8],
-) -> std::io::Result<String> {
-    stream.write_all(&z("INSTREAM")).await?;
-    for chunk in bytes.chunks(CHUNK_SIZE) {
-        stream.write_all(&(chunk.len() as u32).to_be_bytes()).await?;
-        stream.write_all(chunk).await?;
-    }
-    stream.write_all(&0u32.to_be_bytes()).await?;
-    stream.flush().await?;
     let mut response = String::new();
     stream.read_to_string(&mut response).await?;
     Ok(response.trim_end().to_owned())
@@ -117,6 +129,12 @@ fn parse_verdict(response: &str) -> FileVerdict {
             ..Default::default()
         };
     }
+    if body.contains("INSTREAM size limit exceeded") {
+        return FileVerdict::error(
+            "clamd rejected the stream: INSTREAM size limit exceeded \
+             (raise StreamMaxLength in clamd.conf to cover worker max_file_size)",
+        );
+    }
     FileVerdict::error(format!("clamd error: {body}"))
 }
 
@@ -131,7 +149,7 @@ fn parse_version(response: &str) -> AvProfile {
     profile
 }
 
-async fn walk_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+async fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
@@ -169,28 +187,37 @@ impl ScannerPort for ClamdScanner {
     }
 
     async fn scan(&self, dir: &Path) -> Result<ScanOutput, ScannerError> {
-        let mut files = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
         walk_files(dir, &mut files)
             .await
             .map_err(|e| ScannerError::Io(format!("clamd walk: {e}")))?;
         files.sort();
 
-        let mut entries = Vec::new();
-        for file in files {
+        // Parallel INSTREAM: every future owns its file name, so results
+        // can never be zip-mis-attributed (a previous bug class here).
+        let entries = futures_util::stream::iter(files.into_iter().map(|file| async move {
             let name =
                 file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let bytes = tokio::fs::read(&file)
+            let response = tokio::time::timeout(IO_TIMEOUT, self.instream_file(&file))
                 .await
-                .map_err(|e| ScannerError::Io(format!("clamd read {}: {e}", file.display())))?;
-            let response =
-                tokio::time::timeout(IO_TIMEOUT, self.instream(&bytes)).await.map_err(|_| {
+                .map_err(|_| {
                     ScannerError::Unavailable(format!(
                         "clamd instream timed out after {IO_TIMEOUT:?}"
                     ))
                 })??;
-            entries.push((name, parse_verdict(&response)));
+            Ok::<_, ScannerError>((name, parse_verdict(&response)))
+        }))
+        .buffer_unordered(self.concurrent_scans)
+        .collect::<Vec<Result<_, ScannerError>>>()
+        .await;
+
+        // First Unavailable/Io aborts the whole batch (orchestrator
+        // requeues); verdicts are already collected otherwise.
+        let mut verdicts = Vec::with_capacity(entries.len());
+        for entry in entries {
+            verdicts.push(entry?);
         }
-        Ok(ScanOutput { entries })
+        Ok(ScanOutput { entries: verdicts })
     }
 
     async fn update(&self) -> Result<UpdateOutcome, ScannerError> {
@@ -302,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn protocol_round_trip() {
         let (address, log) = spawn_fake_clamd().await;
-        let scanner = ClamdScanner::new(&address);
+        let scanner = ClamdScanner::new(&address, 2);
 
         assert!(scanner.is_installed().await.unwrap());
         let profile = scanner.profile().await.unwrap();
@@ -337,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn unreachable_daemon_maps_to_unavailable() {
         // Port 1 on localhost is practically always closed.
-        let scanner = ClamdScanner::new("127.0.0.1:1");
+        let scanner = ClamdScanner::new("127.0.0.1:1", 4);
         assert!(!scanner.is_installed().await.unwrap());
         let err = scanner.scan(Path::new(".")).await.unwrap_err();
         assert!(matches!(err, ScannerError::Unavailable(_)));
@@ -356,6 +383,49 @@ mod tests {
             parse_verdict("stream:.Integer overflow. ERROR").outcome,
             ScanOutcome::Error { .. }
         ));
+        // The stream limit gets a dedicated, actionable message.
+        let verdict = parse_verdict("stream: INSTREAM size limit exceeded. ERROR");
+        match verdict.outcome {
+            ScanOutcome::Error { message } => {
+                assert!(message.contains("StreamMaxLength"));
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_instream_keeps_per_file_attribution() {
+        let (address, _log) = spawn_fake_clamd().await;
+        let scanner = ClamdScanner::new(&address, 4);
+
+        let tmp = std::env::temp_dir().join(format!("vs-clamd-conc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut expected = std::collections::HashMap::new();
+        for i in 0..12u32 {
+            let dirty = i % 3 == 1;
+            let content = if dirty {
+                format!("sample {i} with EICAR marker")
+            } else {
+                format!("clean sample {i}")
+            };
+            let name = format!("file-{i:02}.bin");
+            std::fs::write(tmp.join(&name), content).unwrap();
+            expected.insert(name, dirty);
+        }
+
+        let output = scanner.scan(&tmp).await.unwrap();
+        assert_eq!(output.entries.len(), 12);
+        assert_eq!(output.entries.len(), expected.len());
+        for (name, verdict) in &output.entries {
+            let dirty = expected.get(name).copied().expect("file we wrote");
+            if dirty {
+                assert!(matches!(verdict.outcome, ScanOutcome::Detected { .. }), "file {name}");
+            } else {
+                assert_eq!(verdict.outcome, ScanOutcome::Clean, "file {name}");
+            }
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 /// Scanner slugs this build knows about. The worker's registry implements
 /// these; the CLI's `--scanner all` fans out to every one of them.
-pub const KNOWN_SCANNERS: &[&str] = &["clamd", "defender", "debug"];
+pub const KNOWN_SCANNERS: &[&str] = &["clamd", "debug", "defender", "hash-blocklist", "yara-x"];
 
 pub mod av;
 pub mod batch;

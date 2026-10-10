@@ -23,6 +23,7 @@ docs and code disagree, fix the doc.
 | D8 | NATS mode | JetStream: workqueue stream for requests, limits-retention stream for reports, durable pull consumers, explicit ack, `Nats-Msg-Id` dedupe. |
 | D9 | Platforms | Windows-first (AV world) with first-class Linux support (clamd/debug CI, deployments). Cross-platform from day one. |
 | D10 | Gates | versa-bot style: pinned toolchain, 2024 edition, `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked` → `cargo test --locked`; `[lints.clippy]` deny `unwrap_used`, `indexing_slicing`. |
+| D11 | Scanners v2 (open/free focus) | Commercial AVs dropped. New adapters: `yara-x` (embedded YARA-X lib; rules dir/file, stat-fingerprint hot-reload, engine-side `set_timeout` bounds pathological rules), `hash-blocklist` (local sha256 feeds, comment/label format, stat-skip reload, forced reload in `update()`). `clamd` stays TCP-only (INSTREAM avoids clamd file-permission issues, works remotely); improvements: streamed file chunks (no full buffering), `[clamd] concurrent_scans` parallel INSTREAM, per-future name attribution, size-limit ERROR → actionable per-file message. Bad yara rules are `ScanFailed` (terminal, error reports), never `NotInstalled` (which would requeue forever). |
 
 ## System shape
 

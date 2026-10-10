@@ -63,11 +63,45 @@ impl Default for WorkerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ClamdConfig {
     pub address: String,
+    /// Parallel INSTREAM connections per batch (clamd multiplexes fine).
+    pub concurrent_scans: usize,
 }
 
 impl Default for ClamdConfig {
     fn default() -> Self {
-        Self { address: "localhost:3310".to_owned() }
+        Self { address: "localhost:3310".to_owned(), concurrent_scans: 4 }
+    }
+}
+
+/// `[yara_x]` - rule source for the `yara-x` scanner.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct YaraXConfig {
+    /// Rule file, or directory scanned recursively for `*.yar` / `*.yara`.
+    pub rules_path: PathBuf,
+    /// Per-file YARA scan timeout, seconds (the engine aborts the scan
+    /// internally; this stays under the worker's `scan_timeout_secs`).
+    pub timeout_secs: u64,
+}
+
+impl Default for YaraXConfig {
+    fn default() -> Self {
+        Self { rules_path: PathBuf::from("rules"), timeout_secs: 120 }
+    }
+}
+
+/// `[hash_blocklist]` - sha256 feeds for the `hash-blocklist` scanner.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HashBlocklistConfig {
+    /// Feed files: one sha256 hex per line, `#` comments, optional free-form
+    /// label after the hash. Missing entries are skipped with a warning.
+    pub feeds: Vec<PathBuf>,
+}
+
+impl Default for HashBlocklistConfig {
+    fn default() -> Self {
+        Self { feeds: Vec::new() }
     }
 }
 
@@ -156,6 +190,10 @@ pub struct Configuration {
     pub logging: LoggingConfig,
     /// clamd scanner endpoint; required when `worker.scanner = "clamd"`.
     pub clamd: Option<ClamdConfig>,
+    /// Rule source; required when `worker.scanner = "yara-x"`.
+    pub yara_x: Option<YaraXConfig>,
+    /// Feed list; required when `worker.scanner = "hash-blocklist"`.
+    pub hash_blocklist: Option<HashBlocklistConfig>,
 }
 
 impl Default for Configuration {
@@ -166,6 +204,8 @@ impl Default for Configuration {
             self_update: SelfUpdateConfig::default(),
             logging: LoggingConfig::default(),
             clamd: None,
+            yara_x: None,
+            hash_blocklist: None,
         }
     }
 }
@@ -194,7 +234,13 @@ impl Configuration {
             )));
         }
         builder = builder.add_source(
-            config::Environment::with_prefix(ENV_PREFIX).separator("__").try_parsing(true),
+            config::Environment::with_prefix(ENV_PREFIX)
+                // `VERSA_SCAN_<SECTION>__<KEY>`: the prefix consumes one `_`,
+                // `__` separates nesting levels. Without this the crate
+                // expects `VERSA_SCAN__WORKER__SCANNER` (silent no-override).
+                .prefix_separator("_")
+                .separator("__")
+                .try_parsing(true),
         );
         builder
             .build()
@@ -248,6 +294,26 @@ impl Configuration {
     pub fn clamd_address(&self) -> String {
         self.clamd.clone().unwrap_or_default().address
     }
+
+    /// Parallel clamd INSTREAM connections (at least 1).
+    pub fn clamd_concurrent_scans(&self) -> usize {
+        self.clamd.clone().unwrap_or_default().concurrent_scans.max(1)
+    }
+
+    /// YARA rule source path from `[yara_x]` (defaults apply when absent).
+    pub fn yara_x_rules_path(&self) -> PathBuf {
+        self.yara_x.clone().unwrap_or_default().rules_path
+    }
+
+    /// Per-file YARA scan timeout from `[yara_x]`.
+    pub fn yara_x_timeout(&self) -> Duration {
+        Duration::from_secs(self.yara_x.clone().unwrap_or_default().timeout_secs)
+    }
+
+    /// sha256 feed paths from `[hash_blocklist]`.
+    pub fn hash_blocklist_feeds(&self) -> Vec<PathBuf> {
+        self.hash_blocklist.clone().unwrap_or_default().feeds
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +321,19 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn env_overrides_apply() {
+        // SAFETY: single-threaded test binary assumptions aside, this key is
+        // unique to this test; no other test reads it.
+        unsafe {
+            std::env::set_var("VERSA_SCAN_YARA_X__RULES_PATH", "from-env/rules.yar");
+            std::env::set_var("VERSA_SCAN_WORKER__FILES_PER_BATCH", "3");
+        }
+        let config = Configuration::load(None).unwrap();
+        assert_eq!(config.yara_x_rules_path(), PathBuf::from("from-env/rules.yar"));
+        assert_eq!(config.worker.files_per_batch, 3);
+    }
 
     #[test]
     fn defaults_are_valid() {
@@ -307,6 +386,50 @@ address = \"clamd.internal:3310\"
         assert_eq!(config.bus.backend, BusBackend::Nats);
         assert_eq!(config.bus.nats.as_ref().unwrap().url, "nats://broker:4222");
         assert_eq!(config.clamd_address(), "clamd.internal:3310");
+    }
+
+    #[test]
+    fn parses_scanner_sections() {
+        let toml = "
+[yara_x]
+rules_path = \"signatures/demo.yar\"
+timeout_secs = 30
+
+[hash_blocklist]
+feeds = [\"feeds/a.sha256\", \"feeds/b.sha256\"]
+
+[clamd]
+address = \"clamd.internal:3310\"
+concurrent_scans = 8
+";
+        let config: Configuration = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(config.yara_x_rules_path(), std::path::PathBuf::from("signatures/demo.yar"));
+        assert_eq!(config.yara_x_timeout(), Duration::from_secs(30));
+        assert_eq!(config.hash_blocklist_feeds().len(), 2);
+        assert_eq!(config.clamd_concurrent_scans(), 8);
+    }
+
+    #[test]
+    fn scanner_section_defaults_apply_when_absent() {
+        let config = Configuration::default();
+        assert_eq!(config.yara_x_rules_path(), std::path::PathBuf::from("rules"));
+        assert_eq!(config.yara_x_timeout(), Duration::from_secs(120));
+        assert!(config.hash_blocklist_feeds().is_empty());
+        assert_eq!(config.clamd_concurrent_scans(), 4);
+        // Zero concurrent scans is clamped to 1, never a stall.
+        let toml = "[clamd]\nconcurrent_scans = 0";
+        let config: Configuration = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(config.clamd_concurrent_scans(), 1);
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! - [`debug`] - deterministic verdicts from file names/content; the
 //!   test/e2e workhorse.
 //! - [`clamd`] - clamd TCP protocol (PING/VERSION/INSTREAM); the
-//!   cross-platform real scanner.
+//!   cross-platform real scanner (ClamAV on Windows and Linux).
+//! - [`yara_x`] - embedded pure-Rust YARA-X engine over user rules.
+//! - [`hash_blocklist`] - sha256 feed matcher (blocklist feeds).
 //! - [`defender`] - Windows Defender via `MpCmdRun.exe` + PowerShell
 //!   status; gracefully unusable off-Windows (path probes fail).
 
@@ -13,11 +15,15 @@ use std::path::Path;
 pub mod clamd;
 pub mod debug;
 pub mod defender;
+pub mod hash_blocklist;
 pub mod proc;
+pub mod yara_x;
 
 pub use clamd::ClamdScanner;
 pub use debug::DebugScanner;
 pub use defender::DefenderScanner;
+pub use hash_blocklist::HashBlocklistScanner;
+pub use yara_x::YaraXScanner;
 
 /// Recursive file listing shared by scanner adapters that walk a batch
 /// workspace (keyed by file name at the adapter boundary).

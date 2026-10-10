@@ -9,7 +9,8 @@
 # (<scanner>.sandbox... / <scanner>.openbox...).
 # role = "sandbox"
 
-# Scanner slug this worker drives: "clamd", "defender", "debug".
+# Scanner slug this worker drives: "clamd", "yara-x", "hash-blocklist",
+# "defender", "debug".
 # scanner = "clamd"
 
 # Root directory for batch workspaces (fetched samples + reports state).
@@ -48,6 +49,23 @@ url = "nats://localhost:4222"
 ack_wait_secs = 300
 # Redelivery cap; workers publish error reports on the final attempt.
 max_deliver = 3
+
+# [clamd]
+# address = "localhost:3310"
+# Parallel INSTREAM connections per batch (1 = serial scans).
+# concurrent_scans = 4
+
+# [yara_x]
+# Single rule file or a directory searched recursively for *.yar/*.yara.
+# Rules compile at first use and reload automatically when files change.
+# rules_path = "rules"
+# Per-file engine timeout; must stay under worker.scan_timeout_secs.
+# timeout_secs = 120
+
+# [hash_blocklist]
+# Feed files: one sha256 per line, `#` comments, optional label after the
+# hash. Scans pick up changed files automatically; `update()` re-reads.
+# feeds = ["feeds/malwarebazaar.sha256"]
 
 [self_update]
 enabled = false

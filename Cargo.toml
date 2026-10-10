@@ -54,6 +54,7 @@ tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.11", features = ["v4"] }
+yara-x = "1.21.0"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [workspace.lints.clippy]
