@@ -55,10 +55,6 @@ impl InMemoryPublisher {
     pub fn pending(&self, scanner: &ScannerId) -> usize {
         self.shared.queues.lock().get(scanner.as_str()).map(|queue| queue.len()).unwrap_or(0)
     }
-
-    pub(crate) fn shared(&self) -> Arc<InMemoryShared> {
-        Arc::clone(&self.shared)
-    }
 }
 
 #[async_trait]

@@ -9,7 +9,7 @@ use versa_scan_infra::config::Configuration;
 use versa_scan_infra::outbound_adapters::scanners::{ClamdScanner, DebugScanner, DefenderScanner};
 
 /// Every scanner slug this build knows about (for `--detect` output).
-pub const KNOWN: &[&str] = &["clamd", "defender", "debug"];
+pub const KNOWN: &[&str] = versa_scan_core::models::KNOWN_SCANNERS;
 
 /// Builds the configured scanner adapter.
 pub fn build(config: &Configuration) -> anyhow::Result<Arc<dyn ScannerPort>> {

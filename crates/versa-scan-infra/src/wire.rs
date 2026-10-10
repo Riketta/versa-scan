@@ -41,6 +41,24 @@ pub fn request_queue_name(scanner: &ScannerId) -> String {
 /// destinations from it (e.g. `vs.scan.reports.<session>.<sample>`).
 pub const REPORTS_SUBJECT_ROOT: &str = "vs.scan.reports.";
 
+/// NATS report destination for one sample of one submitting session:
+/// `vs.scan.reports.<session>.<sample_id>` (the worker publishes exactly
+/// there; the session subscribes `<prefix>.*`).
+pub fn nats_report_subject(session: &str, sample_id: &SampleId) -> String {
+    format!("{REPORTS_SUBJECT_ROOT}{session}.{}", sample_id.as_str())
+}
+
+/// NATS wildcard subscription covering a session's report subjects.
+pub fn nats_report_session_wildcard(session: &str) -> String {
+    format!("{REPORTS_SUBJECT_ROOT}{session}.*")
+}
+
+/// RabbitMQ report queue for one submitting session (shared by all its
+/// samples; the requester declares it before publishing requests).
+pub fn rabbitmq_report_queue(session: &str) -> String {
+    format!("{REPORTS_SUBJECT_ROOT}{session}")
+}
+
 /// Mapping/validation failure at the wire boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid wire field `{field}`: {reason}")]

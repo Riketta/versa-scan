@@ -19,15 +19,8 @@ use tokio_util::sync::CancellationToken;
 use versa_scan_core::models::ids::ScannerId;
 use versa_scan_core::ports::driving::scan_pipeline::ScanPipelinePort;
 
+use super::ListenerError;
 use crate::config::{BusBackend, BusConfig};
-
-#[derive(Debug, thiserror::Error)]
-pub enum ListenerError {
-    #[error("bus connection failed: {0}")]
-    Connection(String),
-    #[error("bus configuration error: {0}")]
-    Configuration(String),
-}
 
 /// One active listener per worker, wired at the composition root alongside
 /// the pipeline.

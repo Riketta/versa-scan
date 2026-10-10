@@ -2,6 +2,10 @@
 //! its wire DTOs onto these at the boundary (ACL); nothing here carries
 //! wire-format knowledge.
 
+/// Scanner slugs this build knows about. The worker's registry implements
+/// these; the CLI's `--scanner all` fans out to every one of them.
+pub const KNOWN_SCANNERS: &[&str] = &["clamd", "defender", "debug"];
+
 pub mod av;
 pub mod batch;
 pub mod digest;

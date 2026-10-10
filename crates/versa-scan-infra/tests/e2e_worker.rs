@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use versa_scan_core::models::digest::Sha256Digest;
 use versa_scan_core::models::ids::{CorrelationId, SampleId, ScannerId};

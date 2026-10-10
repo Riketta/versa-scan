@@ -14,9 +14,10 @@ const DEFAULT_FILE: &str = "versa-scan.toml";
 const ENV_PREFIX: &str = "VERSA_SCAN";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum BusBackend {
+    #[serde(rename = "rabbitmq", alias = "rabbit_mq")]
     RabbitMq,
+    #[serde(rename = "nats")]
     Nats,
 }
 
@@ -260,6 +261,21 @@ mod tests {
         let config = Configuration::default();
         assert_eq!(config.worker.files_per_batch, 10);
         assert_eq!(config.bus.backend, BusBackend::RabbitMq);
+    }
+
+    #[test]
+    fn backend_spellings() {
+        for backend in ["rabbitmq", "rabbit_mq", "nats"] {
+            let toml = format!("[bus]\nbackend = \"{backend}\"");
+            let config: Configuration = config::Config::builder()
+                .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+                .build()
+                .unwrap()
+                .try_deserialize()
+                .unwrap_or_else(|e| panic!("backend {backend:?} must parse: {e}"));
+            let expected = if backend == "nats" { BusBackend::Nats } else { BusBackend::RabbitMq };
+            assert_eq!(config.bus.backend, expected);
+        }
     }
 
     #[test]
