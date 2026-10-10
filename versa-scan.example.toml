@@ -38,7 +38,7 @@ scanner_unavailable_backoff_secs = 10
 backend = "rabbitmq"
 
 [bus.rabbitmq]
-url = "amqp://guest:guest@localhost:5672/%2f"
+url = "amqp://versa:versa@localhost:5672/%2f"
 # Consumer prefetch (unacked messages per worker).
 prefetch = 20
 

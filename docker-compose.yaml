@@ -10,7 +10,13 @@
 
 services:
   rabbitmq:
-    image: rabbitmq:3.13-management
+    image: rabbitmq:3.13
+    restart: unless-stopped
+    environment:
+      # Dedicated user: the default `guest` is restricted to loopback
+      # connections, which docker bridge NAT breaks.
+      RABBITMQ_DEFAULT_USER: versa
+      RABBITMQ_DEFAULT_PASS: versa
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -22,6 +28,7 @@ services:
 
   nats:
     image: nats:2.11
+    restart: unless-stopped
     command: ["-js", "-m", "8222"]
     ports:
       - "4222:4222"

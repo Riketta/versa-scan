@@ -251,8 +251,11 @@ JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps. DTOs live in
   regardless of priority; the RMQ adapter honors `x-max-priority`.
 - Reports: stream `VS_SCAN_REPORTS`, subjects `vs.scan.reports.<scanner>.<sample_id>`,
   `LimitsPolicy` + `max_age = 7d`, `Nats-Msg-Id = <sample_id>.<scanner>.<attempt>`
-  (worker-side republish dedupe). `vscli --wait` uses a plain subscription on its
-  report subject; core NATS request-reply NOT used (one uniform JetStream path
+  (worker-side republish dedupe). `vscli --wait` consumes via an ephemeral pull
+  consumer on its session wildcard (`DeliverPolicy::New`, inactive-threshold
+  cleanup) - JetStream publishes never reach plain core-NATS subscribers, so
+  the listener MUST consume from the stream. One uniform JetStream path for
+  both CLI and future collectors.
   for both CLI and future collectors). Settlement: ack / nak / term.
 
 ## vsd (worker daemon)

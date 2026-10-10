@@ -12,6 +12,7 @@ use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, QueueDeclareOpti
 use lapin::types::{AMQPValue, FieldTable};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 use versa_scan_core::models::ids::ScannerId;
+use versa_scan_core::models::priority::Priority;
 use versa_scan_core::models::report::ScanReport;
 use versa_scan_core::models::sample::{ReportDest, SampleRequest};
 use versa_scan_core::ports::driven::{PublishError, ReportPublisherPort, RequestPublisherPort};
@@ -64,6 +65,7 @@ impl RabbitMqPublisher {
         &self,
         routing_key: &str,
         payload: &[u8],
+        priority: u8,
     ) -> Result<(), PublishError> {
         let confirm = self
             .channel
@@ -72,7 +74,7 @@ impl RabbitMqPublisher {
                 routing_key,
                 BasicPublishOptions::default(),
                 payload,
-                BasicProperties::default().with_delivery_mode(2),
+                BasicProperties::default().with_delivery_mode(2).with_priority(priority),
             )
             .await
             .map_err(|e| PublishError::Publish(format!("rabbitmq publish: {e}")))?;
@@ -98,7 +100,14 @@ impl RequestPublisherPort for RabbitMqPublisher {
         let dto = SampleRequestV1::from_model(request);
         let payload = serde_json::to_vec(&dto)
             .map_err(|e| PublishError::Publish(format!("request serialize: {e}")))?;
-        self.publish_confirmed(&queue, &payload).await
+        // Wire the DTO's priority band onto the AMQP property so the
+        // broker's priority queue can order deliveries (High > Normal > Low).
+        let priority = match request.priority {
+            Priority::Low => 0u8,
+            Priority::Normal => 1,
+            Priority::High => 2,
+        };
+        self.publish_confirmed(&queue, &payload, priority).await
     }
 }
 
@@ -112,6 +121,6 @@ impl ReportPublisherPort for RabbitMqPublisher {
         let dto = ScanReportV1::from_model(report);
         let payload = serde_json::to_vec(&dto)
             .map_err(|e| PublishError::Publish(format!("report serialize: {e}")))?;
-        self.publish_confirmed(dest.as_str(), &payload).await
+        self.publish_confirmed(dest.as_str(), &payload, 0).await
     }
 }

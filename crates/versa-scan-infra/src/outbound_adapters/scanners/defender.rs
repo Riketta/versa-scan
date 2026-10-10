@@ -132,10 +132,11 @@ impl DefenderScanner {
                 continue;
             }
             let detection = detection_part.trim_end_matches('!').trim().to_owned();
-            let file_name = Path::new(&name_part)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or(name_part);
+            // MpCmdRun prints Windows paths (backslash separators) no matter
+            // where we run - split on both separators explicitly so the
+            // parser behaves identically off-Windows.
+            let file_name =
+                name_part.replace('\\', "/").rsplit('/').next().unwrap_or(&name_part).to_owned();
             let verdict = FileVerdict {
                 outcome: ScanOutcome::Detected {
                     detections: vec![Detection { name: detection, link: None }],

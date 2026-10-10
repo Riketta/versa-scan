@@ -68,7 +68,7 @@ Broker integration tests are skipped unless the brokers are reachable:
 
 ```
 docker compose up -d rabbitmq nats clamd
-VERSA_SCAN_TEST_RABBITMQ=amqp://guest:guest@localhost:5672/%2f \
+VERSA_SCAN_TEST_RABBITMQ=amqp://versa:versa@localhost:5672/%2f \
 VERSA_SCAN_TEST_NATS=nats://localhost:4222 \
 cargo test
 ```

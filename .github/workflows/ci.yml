@@ -54,7 +54,7 @@ jobs:
 
       - name: Tests
         env:
-          VERSA_SCAN_TEST_RABBITMQ: amqp://guest:guest@localhost:5672/%2f
+          VERSA_SCAN_TEST_RABBITMQ: amqp://versa:versa@localhost:5672/%2f
           VERSA_SCAN_TEST_NATS: nats://localhost:4222
         run: cargo +1.98 test
 
