@@ -1,0 +1,40 @@
+# Local development brokers + scanner for versa-scan.
+# Used by integration tests (Linux CI) and manual e2e runs.
+#
+#   docker compose up -d rabbitmq nats clamd
+#
+# Ports:
+#   rabbitmq  5672 (amqp), 15672 (management UI, guest/guest)
+#   nats      4222 (client), 8222 (monitoring)
+#   clamd     3310 (clamd TCP; freshclam warms up on first boot)
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2.11
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clamd:
+    image: clamav/clamav:1.4
+    ports:
+      - "3310:3310"
+    # freshclam needs a few minutes on first boot before clamd accepts
+    # INSTREAM connections; integration tests wait for the PING handshake.

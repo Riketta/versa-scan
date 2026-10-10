@@ -1,0 +1,22 @@
+[package]
+name = "vsd"
+description = "versa-scan worker daemon: consumes scan requests, drives a scanner, publishes reports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vsd"
+path = "src/main.rs"
+
+[dependencies]
+versa-scan-core.workspace = true
+versa-scan-infra.workspace = true
+
+anyhow = "1.0.104"
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

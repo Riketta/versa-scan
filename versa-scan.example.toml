@@ -1,0 +1,63 @@
+# versa-scan worker/CLI configuration example.
+# Copy to versa-scan.toml and adjust. Every key can be overridden via
+# VERSA_SCAN_<SECTION>__<KEY> environment variables (double underscore
+# separates nesting levels), e.g. VERSA_SCAN_WORKER__SCANNER=clamd.
+
+[worker]
+# Role of this deployment: "sandbox" (scan pipeline) or "openbox"
+# (database/self-update loop). Omit to auto-detect from the hostname
+# (<scanner>.sandbox... / <scanner>.openbox...).
+# role = "sandbox"
+
+# Scanner slug this worker drives: "clamd", "defender", "debug".
+# scanner = "clamd"
+
+# Root directory for batch workspaces (fetched samples + reports state).
+# Cleaned automatically; swept of leftovers at startup.
+workspace_root = "vl_tasks"
+
+# Batching: how many samples per scanner run, and how long an under-filled
+# batch waits for more requests before flushing (milliseconds).
+files_per_batch = 10
+batch_idle_timeout_ms = 250
+
+# Hard timeout for one scanner run over a batch directory.
+scan_timeout_secs = 900
+
+# Parallel sample downloads per batch.
+fetch_concurrency = 4
+
+# Refuse samples larger than this (bytes); also enforced pre-fetch.
+max_file_size = 524288000  # 500 MiB
+
+# Cooldown after "scanner unavailable" before the worker retries.
+scanner_unavailable_backoff_secs = 10
+
+[bus]
+# "rabbitmq" or "nats".
+backend = "rabbitmq"
+
+[bus.rabbitmq]
+url = "amqp://guest:guest@localhost:5672/%2f"
+# Consumer prefetch (unacked messages per worker).
+prefetch = 20
+
+[bus.nats]
+url = "nats://localhost:4222"
+# How long the broker waits for an ack before redelivering.
+ack_wait_secs = 300
+# Redelivery cap; workers publish error reports on the final attempt.
+max_deliver = 3
+
+[self_update]
+enabled = false
+# Base URL serving manifest.txt ("<semver>;<sha256>") and version archives.
+url = "http://updates.local/vsd"
+check_interval_secs = 900
+# false = check and log only; true = download + swap automatically.
+auto_apply = false
+
+[logging]
+# tracing EnvFilter directive; defaults to "info" ("debug" with --debug).
+# RUST_LOG always wins.
+# filter = "info,vsd=debug"

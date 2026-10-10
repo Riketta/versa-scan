@@ -1,0 +1,50 @@
+# CI for versa-scan: fmt -> clippy -> tests on both target OSes, then
+# broker-backed integration tests on Linux (added from M2 onward via
+# docker-compose services).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.98 --profile minimal --component rustfmt,clippy
+
+      - name: Rustfmt (verify formatting)
+        run: cargo +1.98 fmt --all -- --check
+
+      - name: Clippy (deny-level lints gate)
+        run: cargo +1.98 clippy --all-targets
+
+      - name: Tests
+        run: cargo +1.98 test
+
+      - name: Build release binaries
+        run: cargo +1.98 build --release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: versa-scan-${{ matrix.os }}
+          path: |
+            target/release/vsd${{ runner.os == 'Windows' && '.exe' || '' }}
+            target/release/vscli${{ runner.os == 'Windows' && '.exe' || '' }}
+          retention-days: 7
