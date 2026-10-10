@@ -266,7 +266,7 @@ impl Orchestrator {
         let fetched = self.fetch_files(&files, &workspace).await;
 
         let mut ok_files: Vec<BatchFile> = Vec::new();
-        for (file, result) in files.into_iter().zip(fetched) {
+        for (file, result) in fetched {
             match result {
                 Ok(_) => ok_files.push(file),
                 Err(err) => self.settle_fetch_failure(file, err, ledger, started_at).await,
@@ -373,17 +373,22 @@ impl Orchestrator {
         // `workspace` drops here: directory removed, crash or not.
     }
 
+    /// Fetches concurrently; results carry their own file - completion
+    /// order is arbitrary, so results must never be zipped positionally.
     async fn fetch_files(
         &self,
         files: &[BatchFile],
         workspace: &crate::services::workspace::BatchWorkspace,
-    ) -> Vec<Result<FetchedFile, FetchError>> {
+    ) -> Vec<(BatchFile, Result<FetchedFile, FetchError>)> {
         let fetcher = Arc::clone(&self.fetcher);
         futures_util::stream::iter(files.iter().cloned())
             .map(|file| {
                 let fetcher = Arc::clone(&fetcher);
                 let dest = workspace.files_dir().join(&file.local_name);
-                async move { fetcher.fetch(&file.request, &dest).await }
+                async move {
+                    let result = fetcher.fetch(&file.request, &dest).await;
+                    (file, result)
+                }
             })
             .buffer_unordered(self.settings.fetch_concurrency.max(1))
             .collect()

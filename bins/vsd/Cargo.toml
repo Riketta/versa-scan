@@ -15,7 +15,9 @@ versa-scan-infra.workspace = true
 
 anyhow = "1.0.104"
 clap.workspace = true
+hostname = "0.4"
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 [lints]

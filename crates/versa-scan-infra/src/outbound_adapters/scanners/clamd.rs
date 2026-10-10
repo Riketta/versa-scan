@@ -1,0 +1,368 @@
+//! clamd scanner: speaks the clamd TCP protocol (PING / VERSION / INSTREAM)
+//! against a running `clamd` daemon. Cross-platform - this is the real
+//! scanner used on Linux deployments and in CI.
+//!
+//! INSTREAM framing: client sends `zINSTREAM\0`, then chunks of
+//! `<u32 big-endian length><bytes>`, terminated by a zero-length chunk; the
+//! daemon answers `stream: OK` or `stream: <detection> FOUND` and closes.
+//!
+//! Scanner semantics for the orchestrator:
+//! - daemon unreachable / connection dropped mid-scan -> `Unavailable`
+//!   (transient, batch is requeued)
+//! - daemon-reported per-file ERROR -> per-file error verdict (terminal)
+//! - `update()` shells out to `freshclam`
+
+use std::path::Path;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use versa_scan_core::models::av::AvProfile;
+use versa_scan_core::models::ids::ScannerId;
+use versa_scan_core::models::verdict::{FileVerdict, ScanOutcome};
+use versa_scan_core::ports::driven::scanner::{
+    ScanOutput, ScannerError, ScannerPort, UpdateOutcome,
+};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const IO_TIMEOUT: Duration = Duration::from_secs(60);
+const CHUNK_SIZE: usize = 32 * 1024;
+
+pub struct ClamdScanner {
+    address: String,
+}
+
+impl ClamdScanner {
+    pub fn new(address: impl Into<String>) -> Self {
+        Self { address: address.into() }
+    }
+
+    async fn connect(&self) -> Result<TcpStream, ScannerError> {
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&self.address))
+            .await
+            .map_err(|_| {
+                ScannerError::Unavailable(format!(
+                    "clamd connect timed out after {CONNECT_TIMEOUT:?}"
+                ))
+            })?
+            .map_err(|e| ScannerError::Unavailable(format!("clamd connect {}: {e}", self.address)));
+        let stream = stream?;
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
+    }
+
+    async fn command(&self, command: &[u8]) -> Result<String, ScannerError> {
+        let mut stream = self.connect().await?;
+        run_command(&mut stream, command)
+            .await
+            .map_err(|e| ScannerError::Unavailable(format!("clamd {}: {e}", self.address)))
+    }
+
+    async fn instream(&self, bytes: &[u8]) -> Result<String, ScannerError> {
+        let mut stream = self.connect().await?;
+        send_instream(&mut stream, bytes)
+            .await
+            .map_err(|e| ScannerError::Unavailable(format!("clamd instream: {e}")))
+    }
+}
+
+fn z(command: &str) -> Vec<u8> {
+    let mut bytes = command.as_bytes().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+async fn run_command<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    command: &[u8],
+) -> std::io::Result<String> {
+    stream.write_all(command).await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response.trim_end().to_owned())
+}
+
+/// Sends one sample through INSTREAM; returns the daemon's response line.
+async fn send_instream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    bytes: &[u8],
+) -> std::io::Result<String> {
+    stream.write_all(&z("INSTREAM")).await?;
+    for chunk in bytes.chunks(CHUNK_SIZE) {
+        stream.write_all(&(chunk.len() as u32).to_be_bytes()).await?;
+        stream.write_all(chunk).await?;
+    }
+    stream.write_all(&0u32.to_be_bytes()).await?;
+    stream.flush().await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response.trim_end().to_owned())
+}
+
+fn parse_verdict(response: &str) -> FileVerdict {
+    // `stream: OK` | `stream: <detection> FOUND` | `stream: <detail> ERROR`
+    let body = response.strip_prefix("stream: ").unwrap_or(response);
+    if body == "OK" {
+        return FileVerdict::default();
+    }
+    if let Some(rest) = body.strip_suffix(" FOUND") {
+        return FileVerdict {
+            outcome: ScanOutcome::Detected {
+                detections: vec![versa_scan_core::models::Detection {
+                    name: rest.trim().to_owned(),
+                    link: None,
+                }],
+            },
+            ..Default::default()
+        };
+    }
+    FileVerdict::error(format!("clamd error: {body}"))
+}
+
+fn parse_version(response: &str) -> AvProfile {
+    // "ClamAV 1.0.4/27000/Mon Jun 3 09:57:42 2024" - db version is the
+    // segment after the engine version.
+    let mut profile = AvProfile { av_name: "ClamAV".to_owned(), ..Default::default() };
+    let rest = response.strip_prefix("ClamAV ").unwrap_or(response);
+    let mut parts = rest.split('/');
+    profile.av_version = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    profile.bases_version = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    profile
+}
+
+async fn walk_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_dir() {
+            Box::pin(walk_files(&path, out)).await?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl ScannerPort for ClamdScanner {
+    fn id(&self) -> ScannerId {
+        ScannerId::new("clamd").expect("static slug is valid")
+    }
+
+    async fn is_installed(&self) -> Result<bool, ScannerError> {
+        match self.command(&z("PING")).await {
+            Ok(response) => Ok(response == "PONG"),
+            Err(ScannerError::Unavailable(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn profile(&self) -> Result<AvProfile, ScannerError> {
+        let response = self.command(&z("VERSION")).await?;
+        if response.is_empty() {
+            // clamd returns an empty version line while databases are not
+            // loaded yet (freshclam warming up).
+            return Ok(AvProfile { av_name: "ClamAV".to_owned(), ..Default::default() });
+        }
+        Ok(parse_version(&response))
+    }
+
+    async fn scan(&self, dir: &Path) -> Result<ScanOutput, ScannerError> {
+        let mut files = Vec::new();
+        walk_files(dir, &mut files)
+            .await
+            .map_err(|e| ScannerError::Io(format!("clamd walk: {e}")))?;
+        files.sort();
+
+        let mut entries = Vec::new();
+        for file in files {
+            let name =
+                file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let bytes = tokio::fs::read(&file)
+                .await
+                .map_err(|e| ScannerError::Io(format!("clamd read {}: {e}", file.display())))?;
+            let response =
+                tokio::time::timeout(IO_TIMEOUT, self.instream(&bytes)).await.map_err(|_| {
+                    ScannerError::Unavailable(format!(
+                        "clamd instream timed out after {IO_TIMEOUT:?}"
+                    ))
+                })??;
+            entries.push((name, parse_verdict(&response)));
+        }
+        Ok(ScanOutput { entries })
+    }
+
+    async fn update(&self) -> Result<UpdateOutcome, ScannerError> {
+        // clamd loads databases via freshclam; the closest update action is
+        // running freshclam once.
+        let output = tokio::process::Command::new("freshclam")
+            .arg("--stdout")
+            .output()
+            .await
+            .map_err(|e| ScannerError::Update(format!("freshclam spawn: {e}")))?;
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.status.success() {
+            return Err(ScannerError::Update(format!(
+                "freshclam exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        if text.contains("up-to-date") || text.contains("up to date") {
+            Ok(UpdateOutcome::UpToDate)
+        } else {
+            Ok(UpdateOutcome::Updated)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+    use std::sync::Arc;
+
+    /// A fake clamd: answers PING/VERSION and runs INSTREAM with canned
+    /// verdicts (content containing "EICAR" -> FOUND, otherwise OK).
+    async fn spawn_fake_clamd() -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let log: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let log = Arc::clone(&log);
+                    tokio::spawn(async move {
+                        handle_socket(socket, log).await;
+                    });
+                }
+            });
+        }
+        (address, log)
+    }
+
+    async fn handle_socket(
+        mut socket: tokio::net::TcpStream,
+        log: Arc<parking_lot::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        // Read the command (z-terminated) byte-by-byte: anything past the
+        // NUL belongs to the INSTREAM framing and must stay in the stream.
+        let mut command = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            socket.read_exact(&mut byte).await.unwrap();
+            if byte[0] == 0 {
+                break;
+            }
+            command.push(byte[0]);
+        }
+        let command = String::from_utf8_lossy(&command).to_string();
+        log.lock().push(format!("cmd:{command}"));
+        match command.as_str() {
+            "PING" => socket.write_all(b"PONG\n").await.unwrap(),
+            "VERSION" => {
+                socket.write_all(b"ClamAV 1.0.4/27000/Mon Jun 3 09:57:42 2024\n").await.unwrap()
+            }
+            "INSTREAM" => {
+                let mut payload = Vec::new();
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    socket.read_exact(&mut len_buf).await.unwrap();
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    if len == 0 {
+                        break;
+                    }
+                    let mut chunk = vec![0u8; len];
+                    socket.read_exact(&mut chunk).await.unwrap();
+                    payload.extend_from_slice(&chunk);
+                }
+                let response = if payload.windows(5).any(|w| w.eq_ignore_ascii_case(b"EICAR")) {
+                    "stream: Win.Test.EICAR FOUND\n"
+                } else {
+                    "stream: OK\n"
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            _ => socket.write_all(b"UNKNOWN COMMAND\n").await.unwrap(),
+        }
+        socket.shutdown().await.ok();
+    }
+
+    fn write_sample(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn protocol_round_trip() {
+        let (address, log) = spawn_fake_clamd().await;
+        let scanner = ClamdScanner::new(&address);
+
+        assert!(scanner.is_installed().await.unwrap());
+        let profile = scanner.profile().await.unwrap();
+        assert_eq!(profile.av_version.as_deref(), Some("1.0.4"));
+        assert_eq!(profile.bases_version.as_deref(), Some("27000"));
+
+        let tmp = std::env::temp_dir().join(format!("vs-clamd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_sample(&tmp, "clean.bin", b"hello world");
+        write_sample(&tmp, "eicar.com", b"X5O!P%@AP[EICAR-TEST-FILE]");
+
+        let output = scanner.scan(&tmp).await.unwrap();
+        assert_eq!(output.entries.len(), 2);
+        let verdict = |name: &str| {
+            output.entries.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(verdict("clean.bin").outcome, ScanOutcome::Clean);
+        match verdict("eicar.com").outcome {
+            ScanOutcome::Detected { detections } => {
+                assert_eq!(detections[0].name, "Win.Test.EICAR");
+            }
+            other => panic!("expected detection, got {other:?}"),
+        }
+
+        // The INSTREAM framing actually reached the fake daemon.
+        let instreams = log.lock().iter().filter(|m| m.as_str() == "cmd:INSTREAM").count();
+        assert_eq!(instreams, 2);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn unreachable_daemon_maps_to_unavailable() {
+        // Port 1 on localhost is practically always closed.
+        let scanner = ClamdScanner::new("127.0.0.1:1");
+        assert!(!scanner.is_installed().await.unwrap());
+        let err = scanner.scan(Path::new(".")).await.unwrap_err();
+        assert!(matches!(err, ScannerError::Unavailable(_)));
+    }
+
+    #[test]
+    fn verdict_parsing() {
+        assert_eq!(parse_verdict("stream: OK").outcome, ScanOutcome::Clean);
+        match parse_verdict("stream: Win.Test.Dropper FOUND").outcome {
+            ScanOutcome::Detected { detections } => {
+                assert_eq!(detections[0].name, "Win.Test.Dropper");
+            }
+            other => panic!("expected detection, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_verdict("stream:.Integer overflow. ERROR").outcome,
+            ScanOutcome::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn version_parsing() {
+        let profile = parse_version("ClamAV 1.0.4/27000/Mon Jun 3 09:57:42 2024");
+        assert_eq!(profile.av_name, "ClamAV");
+        assert_eq!(profile.av_version.as_deref(), Some("1.0.4"));
+        assert_eq!(profile.bases_version.as_deref(), Some("27000"));
+    }
+}

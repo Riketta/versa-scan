@@ -4,8 +4,11 @@
 //! non-reloadable globals).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+use versa_scan_core::models::worker::{WorkerInfo, WorkerRole};
+use versa_scan_core::services::OrchestratorSettings;
 
 const DEFAULT_FILE: &str = "versa-scan.toml";
 const ENV_PREFIX: &str = "VERSA_SCAN";
@@ -17,7 +20,7 @@ pub enum BusBackend {
     Nats,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     /// `sandbox` (scan pipeline) or `openbox` (update loop). Hostname-based
@@ -31,6 +34,8 @@ pub struct WorkerConfig {
     pub batch_idle_timeout_ms: u64,
     pub scan_timeout_secs: u64,
     pub fetch_concurrency: usize,
+    /// Whole-request download timeout, seconds.
+    pub fetch_timeout_secs: u64,
     pub max_file_size: u64,
     pub scanner_unavailable_backoff_secs: u64,
 }
@@ -45,9 +50,23 @@ impl Default for WorkerConfig {
             batch_idle_timeout_ms: 250,
             scan_timeout_secs: 15 * 60,
             fetch_concurrency: 4,
+            fetch_timeout_secs: 300,
             max_file_size: 500 * 1024 * 1024,
             scanner_unavailable_backoff_secs: 10,
         }
+    }
+}
+
+/// `[clamd]` - clamd daemon endpoint for the `clamd` scanner.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClamdConfig {
+    pub address: String,
+}
+
+impl Default for ClamdConfig {
+    fn default() -> Self {
+        Self { address: "localhost:3310".to_owned() }
     }
 }
 
@@ -134,6 +153,8 @@ pub struct Configuration {
     pub bus: BusConfig,
     pub self_update: SelfUpdateConfig,
     pub logging: LoggingConfig,
+    /// clamd scanner endpoint; required when `worker.scanner = "clamd"`.
+    pub clamd: Option<ClamdConfig>,
 }
 
 impl Default for Configuration {
@@ -143,6 +164,7 @@ impl Default for Configuration {
             bus: BusConfig::default(),
             self_update: SelfUpdateConfig::default(),
             logging: LoggingConfig::default(),
+            clamd: None,
         }
     }
 }
@@ -179,6 +201,52 @@ impl Configuration {
             .try_deserialize()
             .map_err(|e| ConfigError::Load(e.to_string()))
     }
+
+    // ------------------------------------------------------------------
+    // Mapping helpers: configuration -> core values. The composition roots
+    // call these; core never sees the config crate.
+    // ------------------------------------------------------------------
+
+    /// Resolves the deployment role: explicit config wins, otherwise the
+    /// hostname decides (`<scanner>.openbox...` / `<scanner>.sandbox...`).
+    pub fn worker_role(&self, hostname: &str) -> Result<WorkerRole, ConfigError> {
+        match self.worker.role.as_deref() {
+            Some(role) => role.parse().map_err(|e: versa_scan_core::models::UnknownRole| {
+                ConfigError::Load(format!("worker.role: {e}"))
+            }),
+            None if hostname.contains("openbox") => Ok(WorkerRole::Openbox),
+            None if hostname.contains("sandbox") => Ok(WorkerRole::Sandbox),
+            None => Err(ConfigError::Load(
+                "worker.role not configured and hostname has no sandbox/openbox marker".to_owned(),
+            )),
+        }
+    }
+
+    /// Builds the worker identity stamped into reports.
+    pub fn worker_info(&self, role: WorkerRole) -> WorkerInfo {
+        WorkerInfo {
+            hostname: hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_default(),
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            role,
+        }
+    }
+
+    /// Maps worker knobs onto the orchestrator's tuning struct.
+    pub fn orchestrator_settings(&self) -> OrchestratorSettings {
+        let worker = &self.worker;
+        OrchestratorSettings {
+            files_per_batch: worker.files_per_batch.max(1),
+            batch_idle_timeout: Duration::from_millis(worker.batch_idle_timeout_ms),
+            scan_timeout: Duration::from_secs(worker.scan_timeout_secs),
+            fetch_concurrency: worker.fetch_concurrency.max(1),
+            scanner_backoff: Duration::from_secs(worker.scanner_unavailable_backoff_secs),
+        }
+    }
+
+    /// clamd endpoint from `[clamd]` (defaults apply when absent).
+    pub fn clamd_address(&self) -> String {
+        self.clamd.clone().unwrap_or_default().address
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +275,9 @@ backend = \"nats\"
 
 [bus.nats]
 url = \"nats://broker:4222\"
+
+[clamd]
+address = \"clamd.internal:3310\"
 ";
         let config: Configuration = config::Config::builder()
             .add_source(config::File::from_str(toml, config::FileFormat::Toml))
@@ -219,5 +290,27 @@ url = \"nats://broker:4222\"
         assert_eq!(config.worker.files_per_batch, 7);
         assert_eq!(config.bus.backend, BusBackend::Nats);
         assert_eq!(config.bus.nats.as_ref().unwrap().url, "nats://broker:4222");
+        assert_eq!(config.clamd_address(), "clamd.internal:3310");
+    }
+
+    #[test]
+    fn role_detection_explicit_wins_over_hostname() {
+        let config = Configuration::default();
+        let mut explicit = config.clone();
+        explicit.worker.role = Some("openbox".to_owned());
+        assert_eq!(explicit.worker_role("clamd.sandbox.example").unwrap(), WorkerRole::Openbox);
+        assert_eq!(config.worker_role("clamd.sandbox.example").unwrap(), WorkerRole::Sandbox);
+        assert_eq!(config.worker_role("kav.openbox.example").unwrap(), WorkerRole::Openbox);
+        assert!(config.worker_role("plain-host").is_err());
+    }
+
+    #[test]
+    fn orchestrator_settings_mapping() {
+        let mut config = Configuration::default();
+        config.worker.files_per_batch = 0; // must clamp to 1
+        let settings = config.orchestrator_settings();
+        assert_eq!(settings.files_per_batch, 1);
+        assert_eq!(settings.batch_idle_timeout, Duration::from_millis(250));
+        assert_eq!(settings.scan_timeout, Duration::from_secs(900));
     }
 }
