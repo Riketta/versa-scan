@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "vsd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vsd"
 path = "src/main.rs"
@@ -14,8 +18,10 @@ versa-scan-core.workspace = true
 versa-scan-infra.workspace = true
 
 anyhow = "1.0.104"
+async-trait.workspace = true
 clap.workspace = true
 hostname = "0.4"
+parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

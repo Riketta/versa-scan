@@ -1,7 +1,9 @@
 //! vsd - the versa-scan worker daemon (composition root #1).
 //!
-//! Sandbox role (M3): consume -> batch -> fetch -> scan -> report.
-//! Openbox role + self-update land in M5.
+//! Sandbox role: consume -> batch -> fetch -> scan -> report.
+//! Openbox role: scanner database updates + worker self-update.
+//! `vsd update check|apply` and `vsd install-task` drive the same
+//! machinery manually.
 
 mod scanner_registry;
 
@@ -15,10 +17,12 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use versa_scan_core::models::worker::WorkerRole;
 use versa_scan_core::ports::driven::fetch::SampleFetcherPort;
+use versa_scan_core::ports::driven::self_update::SelfUpdatePort;
 use versa_scan_core::ports::driving::scan_pipeline::ScanPipelinePort;
 use versa_scan_core::services::Orchestrator;
 use versa_scan_infra::config::Configuration;
 use versa_scan_infra::outbound_adapters::fetch::HttpFetcher;
+use versa_scan_infra::outbound_adapters::self_update as self_update_adapter;
 
 #[derive(Parser)]
 #[command(name = "vsd", version, about = "versa-scan worker daemon")]
@@ -42,8 +46,7 @@ enum Command {
     UpdateCheck,
     /// Download, verify, and swap in a pending worker update, then exit.
     UpdateApply,
-    /// Register the autostart entry for the openbox role (Windows Task
-    /// Scheduler / systemd), then exit.
+    /// Register the autostart entry for the openbox role, then exit.
     InstallTask,
 }
 
@@ -68,6 +71,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         scanner_registry::detect(&config).await;
         return Ok(());
     }
+
+    if let Some(command) = cli.command {
+        let updater = build_updater(&config)?;
+        return match command {
+            Command::UpdateCheck => update_check(updater).await,
+            Command::UpdateApply => update_apply(updater).await,
+            Command::InstallTask => vsd::install::install().await,
+        };
+    }
+
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "<unknown>".to_owned());
@@ -79,22 +92,56 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         "vsd starting"
     );
 
-    if let Some(command) = cli.command {
-        match command {
-            Command::UpdateCheck | Command::UpdateApply | Command::InstallTask => {
-                bail!("subcommand not implemented yet (milestone M5)")
-            }
-        }
-    }
+    let scanner = scanner_registry::build(&config)?;
+    let updater = build_updater(&config)?;
+    let worker_info = config.worker_info(role);
+    let cancel = CancellationToken::new();
+    tokio::spawn(watch_shutdown(cancel.clone()));
 
     match role {
-        WorkerRole::Sandbox => run_sandbox(config).await,
-        WorkerRole::Openbox => bail!("openbox role (update loop) lands in milestone M5"),
+        WorkerRole::Sandbox => run_sandbox(config, scanner, updater, worker_info, cancel).await,
+        WorkerRole::Openbox => {
+            vsd::openbox::run_with_config(&config, scanner, updater, worker_info, cancel).await
+        }
     }
 }
 
-async fn run_sandbox(config: Configuration) -> anyhow::Result<()> {
-    let scanner = scanner_registry::build(&config)?;
+fn build_updater(config: &Configuration) -> anyhow::Result<Option<Arc<dyn SelfUpdatePort>>> {
+    self_update_adapter::from_config(&config.self_update).map_err(anyhow::Error::msg)
+}
+
+async fn update_check(updater: Option<Arc<dyn SelfUpdatePort>>) -> anyhow::Result<()> {
+    let Some(updater) = updater else {
+        println!("self-update is disabled ([self_update].enabled = false)");
+        return Ok(());
+    };
+    match updater.check().await? {
+        Some(update) => println!("update available: {} ({})", update.version, update.url),
+        None => println!("worker is up to date"),
+    }
+    Ok(())
+}
+
+async fn update_apply(updater: Option<Arc<dyn SelfUpdatePort>>) -> anyhow::Result<()> {
+    let Some(updater) = updater else {
+        bail!("self-update is disabled ([self_update].enabled = false)");
+    };
+    let Some(update) = updater.check().await? else {
+        println!("worker is up to date; nothing to apply");
+        return Ok(());
+    };
+    updater.apply(&update).await?;
+    println!("applied worker update {}; restart vsd to run it", update.version);
+    Ok(())
+}
+
+async fn run_sandbox(
+    config: Configuration,
+    scanner: Arc<dyn versa_scan_core::ports::driven::scanner::ScannerPort>,
+    _updater: Option<Arc<dyn SelfUpdatePort>>,
+    worker_info: versa_scan_core::models::WorkerInfo,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     if !scanner.is_installed().await.unwrap_or(false) {
         bail!(
             "scanner {:?} is not installed/reachable; stopping (use --detect to probe)",
@@ -126,13 +173,10 @@ async fn run_sandbox(config: Configuration) -> anyhow::Result<()> {
             publishers.report.clone(),
             config.worker.workspace_root.clone(),
             config.orchestrator_settings(),
-            config.worker_info(WorkerRole::Sandbox),
+            worker_info,
         )
         .context("orchestrator setup")?,
     );
-
-    let cancel = CancellationToken::new();
-    tokio::spawn(watch_shutdown(cancel.clone()));
 
     let pipeline_task = tokio::spawn({
         let orchestrator = Arc::clone(&orchestrator);
@@ -145,7 +189,7 @@ async fn run_sandbox(config: Configuration) -> anyhow::Result<()> {
 
     // Listener ended (shutdown signal): give the pipeline a moment to
     // finish its final flush.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), pipeline_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), pipeline_task).await;
     tracing::info!("vsd stopped");
     Ok(())
 }

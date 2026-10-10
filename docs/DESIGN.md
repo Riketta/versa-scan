@@ -5,9 +5,9 @@ system: one worker per antivirus (VM per scanner), samples dispatched over a mes
 bus, per-sample scan reports published back. CLI replaces the old backend/frontend
 for now.
 
-Status: **design approved pending implementation**. This document is the blueprint;
-`AGENTS.md` (written at M0) becomes the rulebook once code lands. Where this doc
-and code disagree after implementation starts, fix the doc.
+Status: **implemented through M5**. This document is the blueprint and decision
+log; `AGENTS.md` is the rulebook, `README.md` the user-facing manual. Where these
+docs and code disagree, fix the doc.
 
 ## Locked decisions
 
@@ -295,7 +295,7 @@ JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps. DTOs live in
 - Apply: download zip → verify hash → extract to staging dir next to the binary →
   swap. Windows: rename running exe to `.old`, move new into place (rename-swap
   works on a running exe), `.old` cleaned on next start. Linux: plain replace.
-- Triggers: `vsd update check|apply` manual + periodic check in openbox role
+- Triggers: `vsd update-check|update-apply` manual + periodic check in openbox role
   (`auto_apply` flag; default notify-only). Managed restart: exit with a code the
   service/scheduler treats as restart, or `--exec-self` child respawn.
 
@@ -314,34 +314,36 @@ JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps. DTOs live in
 
 ## Milestones
 
-- **M0 — Scaffold.** Workspace, CI (both OS matrix), pinned toolchain, lint
-  config, `AGENTS.md` (architecture rulebook, versa-bot style), empty crates,
-  example TOML, tracing setup, config loading. *Gate: CI green on trivial code.*
-- **M1 — Core.** All models, ports, `BatchPlanner`, `RetryPolicy`, `Validation`,
-  `WorkspaceManager`, `Orchestrator` against in-memory fakes. *Gate: core unit
-  tests comprehensive; `cargo test -p versa-scan-core` is the spec.*
-- **M2 — Bus adapters.** `wire.rs` DTOs + RabbitMQ + NATS listener/publisher
-  adapters + in-memory pair, split by hexagon edge (inbound listeners,
-  outbound publishers).
-  *Gate: integration tests over docker brokers pass (priority, ack semantics,
-  dedupe, confirms, redelivery).*
-- **M3 — Worker.** vsd: clamd + defender + debug scanners, http fetcher,
-  scan pipeline e2e, graceful shutdown, cleanup. *Gate: e2e submit→report over
-  both buses with debug scanner; clamd IT on Linux.*
-- **M4 — CLI.** vscli: CAS store, embedded server, submit/--wait/reports/status.
-  *Gate: `vscli submit --wait` full round-trip vs vsd on both buses; dedupe and
-  range requests tested.*
-- **M5 — Ops.** Self-updater (manifest/swap, both OS), openbox role (update loop,
-  `vsd install-task`), README, Dockerfile, release packaging.
-  *Gate: updater swap tested on Windows + Linux; docs complete.*
+All milestones below are implemented.
+
+- **M0 — Scaffold** ✅. Workspace, CI (Linux + Windows matrix), pinned toolchain,
+  lint config, `AGENTS.md`, empty crates, example TOML, tracing, config loading.
+- **M1 — Core** ✅. Models, ports, `BatchPlanner`, `RetryPolicy`, `Validation`,
+  `WorkspaceManager`, `Orchestrator`; `cargo test -p versa-scan-core` is the spec.
+- **M2 — Bus adapters** ✅. `wire.rs` DTOs + RabbitMQ + NATS listener/publisher
+  adapters + in-memory pair, split by hexagon edge; integration tests over docker
+  brokers (Linux CI) cover priority, ack semantics, dedupe, confirms, redelivery.
+- **M3 — Worker** ✅. vsd: clamd + defender + debug scanners, streaming http
+  fetcher (temp-name + hash verify), scan pipeline e2e, graceful shutdown,
+  workspace cleanup. The e2e caught and fixed the concurrent-fetch attribution bug.
+- **M4 — CLI** ✅. vscli: CAS store, embedded artifact server (range support),
+  submit/--wait/report listeners per backend, reports/status subcommands.
+- **M5 — Ops** ✅. Self-updater (manifest fetch, zip verify/extract, staged swap
+  with Windows rename-dance), openbox role (update loop + auto_apply exit-for-
+  restart), `vsd update-check|update-apply`, `vsd install-task` (schtasks/systemd),
+  README, Dockerfile, release artifacts in CI.
 
 ## Known risks / open items
 
 - NATS has no priority queues by decision: the NATS adapter ignores request
   priority (single subject, FIFO); RMQ provides real priority. No emulation
   complexity is bought.
-- Windows CI has no broker containers → e2e coverage asymmetric by design.
+- **Windows CI has no broker containers** → broker ITs run on the Linux job;
+  Windows runs unit + fixture tests. Windows coverage of the CI matrix:
+  build, lint, unit/e2e (in-memory bus + local artifact server).
 - Commercial AV ports later will need per-AV VMs; adapter template (fixture-driven
   parser tests) established with clamd/defender now.
-- Defender `MpCmdRun` output parsing varies by platform build — fixture matrix
-  needed; the C# stub was never implemented, so this is new code, not a port.
+- Defender `MpCmdRun` output parsing varies by platform build — parser is
+  fixture-based and tolerant; refine fixtures against a real VM capture.
+- vscli reads whole sample files into memory when hashing/storing (CLI-scale
+  fine; workers stream downloads).
