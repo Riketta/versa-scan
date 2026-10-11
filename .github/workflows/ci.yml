@@ -1,6 +1,5 @@
 # CI for versa-scan: fmt -> clippy -> tests on both target OSes, then
-# broker-backed integration tests on Linux (added from M2 onward via
-# docker-compose services).
+# broker-backed integration tests on Linux (docker-compose services).
 
 name: ci
 
@@ -25,6 +24,8 @@ jobs:
     services:
       # Broker integration tests (crates/versa-scan-infra/tests/brokers.rs)
       # run only where these env vars are set - Linux. Windows skips them.
+      # NATS is started as a plain container in a step instead of a service:
+      # service containers cannot pass server args (JetStream needs `-js`).
       rabbitmq:
         image: rabbitmq:3.13
         env:
@@ -35,16 +36,23 @@ jobs:
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 5s --health-timeout 5s --health-retries 10
-      nats:
-        image: nats:2.11
-        args: ["-js"]
-        ports:
-          - 4222:4222
-        options: >-
-          --health-cmd "wget -qO- http://localhost:8222/healthz"
-          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Start NATS with JetStream
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name nats \
+            -p 4222:4222 -p 8222:8222 \
+            nats:2.11 -js -m 8222
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8222/healthz > /dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs nats
+          exit 1
 
       - name: Install pinned toolchain
         run: rustup toolchain install 1.98 --profile minimal --component rustfmt,clippy
