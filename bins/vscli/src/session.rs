@@ -81,6 +81,10 @@ pub struct Session {
     request_publisher: Arc<dyn RequestPublisherPort>,
     waiter: Option<Arc<dyn ReportWaiter>>,
     advertise_base: String,
+    /// Artifact-server token appended to every sample URL (`?token=`); the
+    /// server rejects requests without it when it is configured. Empty =
+    /// auth disabled.
+    artifact_token: String,
     /// Per-sample report destination (backend-specific naming).
     report_dest_for: Arc<dyn Fn(&SampleId) -> ReportDest + Send + Sync>,
     /// Where the session's reports arrive (wildcard subject / queue name).
@@ -93,10 +97,19 @@ impl Session {
         request_publisher: Arc<dyn RequestPublisherPort>,
         waiter: Option<Arc<dyn ReportWaiter>>,
         advertise_base: String,
+        artifact_token: String,
         report_dest_for: Arc<dyn Fn(&SampleId) -> ReportDest + Send + Sync>,
         wait_dest: ReportDest,
     ) -> Self {
-        Self { store, request_publisher, waiter, advertise_base, report_dest_for, wait_dest }
+        Self {
+            store,
+            request_publisher,
+            waiter,
+            advertise_base,
+            artifact_token,
+            report_dest_for,
+            wait_dest,
+        }
     }
 
     pub async fn submit(
@@ -192,10 +205,21 @@ impl Session {
         Ok(SessionResult { rows, reports, missing })
     }
 
+    /// Download URL for one stored sample; `?token=` appended when the
+    /// artifact server expects one.
+    fn sample_url(&self, sha256: &str) -> String {
+        let base = format!("{}/samples/{}", self.advertise_base.trim_end_matches('/'), sha256);
+        if self.artifact_token.is_empty() {
+            base
+        } else {
+            format!("{base}?token={}", self.artifact_token)
+        }
+    }
+
     fn build_request(&self, sample: &Pending, scanner: &str, priority: &Priority) -> SampleRequest {
         SampleRequest {
             sample_id: sample.sample_id.clone(),
-            url: format!("{}/samples/{}", self.advertise_base.trim_end_matches('/'), sample.sha256),
+            url: self.sample_url(&sample.sha256),
             sha256: versa_scan_core::models::Sha256Digest::from_hex(&sample.sha256)
                 .expect("store digests are valid hex"),
             size: sample.size,
@@ -392,8 +416,11 @@ mod tests {
             publisher.clone(),
             None,
             "http://127.0.0.1:8080".to_owned(),
-            Arc::new(|id: &SampleId| ReportDest::new(format!("dest.{}", id.as_str()))),
-            ReportDest::new("dest.wildcard"),
+            String::new(),
+            Arc::new(|id: &SampleId| {
+                ReportDest::new(format!("dest.{id}")).expect("generated dests are valid")
+            }),
+            ReportDest::new("dest.wildcard").unwrap(),
         );
 
         let result = session
@@ -454,8 +481,11 @@ mod tests {
             publisher.clone(),
             Some(waiter),
             "http://127.0.0.1:8080".to_owned(),
-            Arc::new(|id: &SampleId| ReportDest::new(format!("dest.{}", id.as_str()))),
-            ReportDest::new("dest.wildcard"),
+            String::new(),
+            Arc::new(|id: &SampleId| {
+                ReportDest::new(format!("dest.{id}")).expect("generated dests are valid")
+            }),
+            ReportDest::new("dest.wildcard").unwrap(),
         );
 
         let result = session
@@ -530,8 +560,11 @@ mod tests {
             publisher.clone(),
             Some(waiter),
             "http://127.0.0.1:8080".to_owned(),
-            Arc::new(|id: &SampleId| ReportDest::new(format!("dest.{}", id.as_str()))),
-            ReportDest::new("dest.wildcard"),
+            String::new(),
+            Arc::new(|id: &SampleId| {
+                ReportDest::new(format!("dest.{id}")).expect("generated dests are valid")
+            }),
+            ReportDest::new("dest.wildcard").unwrap(),
         );
 
         let result = session

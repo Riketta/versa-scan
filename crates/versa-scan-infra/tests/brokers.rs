@@ -2,9 +2,9 @@
 //! set (Linux CI sets them with docker-compose services; see
 //! `.github/workflows/ci.yml`, `docker-compose.yaml`):
 //!
-//! - `VERSA_SCAN_TEST_RABBITMQ` - amqp URL (e.g.
+//! - `VS_SCAN_TEST_RABBITMQ` - amqp URL (e.g.
 //!   `amqp://guest:guest@localhost:5672/%2f`)
-//! - `VERSA_SCAN_TEST_NATS` - nats URL (e.g. `nats://localhost:4222`)
+//! - `VS_SCAN_TEST_NATS` - nats URL (e.g. `nats://localhost:4222`)
 //!
 //! Each test uses a unique scanner id / report destination so parallel runs
 //! never interfere.
@@ -35,11 +35,11 @@ use versa_scan_infra::wire::{SampleRequestV1, ScanReportV1};
 // ---------------------------------------------------------------- helpers
 
 fn rabbit_url() -> Option<String> {
-    std::env::var("VERSA_SCAN_TEST_RABBITMQ").ok().filter(|s| !s.is_empty())
+    std::env::var("VS_SCAN_TEST_RABBITMQ").ok().filter(|s| !s.is_empty())
 }
 
 fn nats_url() -> Option<String> {
-    std::env::var("VERSA_SCAN_TEST_NATS").ok().filter(|s| !s.is_empty())
+    std::env::var("VS_SCAN_TEST_NATS").ok().filter(|s| !s.is_empty())
 }
 
 fn unique(prefix: &str) -> String {
@@ -68,7 +68,7 @@ fn report(sample_id: &str, scanner: &str) -> ScanReport {
         sample_id: SampleId::new(sample_id).unwrap(),
         correlation_id: CorrelationId::new("corr").unwrap(),
         scanner: ScannerId::new(scanner).unwrap(),
-        report_dest: ReportDest::new("unused"),
+        report_dest: ReportDest::new("unused").unwrap(),
         worker: WorkerInfo {
             hostname: "it-host".to_owned(),
             os: "IT OS".to_owned(),
@@ -148,14 +148,12 @@ fn spawn_listener(
 #[tokio::test]
 async fn rabbitmq_pubsub_and_ack() {
     let Some(url) = rabbit_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_RABBITMQ not set");
+        eprintln!("skipping: VS_SCAN_TEST_RABBITMQ not set");
         return;
     };
     let scanner = ScannerId::new(unique("it-clamd")).unwrap();
     let listener =
-        versa_scan_infra::inbound_adapters::bus::rabbitmq::RabbitMqListener::connect(&url, 20)
-            .await
-            .unwrap();
+        versa_scan_infra::inbound_adapters::bus::rabbitmq::RabbitMqListener::new(&url, 20);
     let publisher = RabbitMqPublisher::connect(&url).await.unwrap();
 
     let (mut rx, cancel, task) = spawn_listener(Arc::new(listener), scanner.clone());
@@ -178,14 +176,12 @@ async fn rabbitmq_pubsub_and_ack() {
 #[tokio::test]
 async fn rabbitmq_nak_redelivers() {
     let Some(url) = rabbit_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_RABBITMQ not set");
+        eprintln!("skipping: VS_SCAN_TEST_RABBITMQ not set");
         return;
     };
     let scanner = ScannerId::new(unique("it-clamd")).unwrap();
     let listener =
-        versa_scan_infra::inbound_adapters::bus::rabbitmq::RabbitMqListener::connect(&url, 20)
-            .await
-            .unwrap();
+        versa_scan_infra::inbound_adapters::bus::rabbitmq::RabbitMqListener::new(&url, 20);
     let publisher = RabbitMqPublisher::connect(&url).await.unwrap();
 
     let (mut rx, cancel, task) = spawn_listener(Arc::new(listener), scanner.clone());
@@ -195,9 +191,9 @@ async fn rabbitmq_nak_redelivers() {
     assert_eq!(first.attempt, 1);
     first.handle.nak_requeue().await;
 
-    let second = wait_for("redelivered", || rx.try_recv().ok()).await;
+    let second = wait_for("republished", || rx.try_recv().ok()).await;
     assert_eq!(second.request.sample_id.as_str(), "nak1");
-    assert_eq!(second.attempt, 2, "redelivered flag maps to attempt 2");
+    assert_eq!(second.attempt, 2, "the requeue republish carries x-vs-attempt = 2");
     second.handle.ack().await;
 
     cancel.cancel();
@@ -207,7 +203,7 @@ async fn rabbitmq_nak_redelivers() {
 #[tokio::test]
 async fn rabbitmq_priority_order() {
     let Some(url) = rabbit_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_RABBITMQ not set");
+        eprintln!("skipping: VS_SCAN_TEST_RABBITMQ not set");
         return;
     };
     let scanner = ScannerId::new(unique("it-clamd")).unwrap();
@@ -219,9 +215,7 @@ async fn rabbitmq_priority_order() {
     publisher.publish_request(scanner.clone(), &request("high", Priority::High)).await.unwrap();
 
     let listener =
-        versa_scan_infra::inbound_adapters::bus::rabbitmq::RabbitMqListener::connect(&url, 20)
-            .await
-            .unwrap();
+        versa_scan_infra::inbound_adapters::bus::rabbitmq::RabbitMqListener::new(&url, 20);
     let (mut rx, cancel, task) = spawn_listener(Arc::new(listener), scanner.clone());
 
     let first = wait_for("first delivery", || rx.try_recv().ok()).await;
@@ -238,7 +232,7 @@ async fn rabbitmq_priority_order() {
 #[tokio::test]
 async fn rabbitmq_report_publish_round_trip() {
     let Some(url) = rabbit_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_RABBITMQ not set");
+        eprintln!("skipping: VS_SCAN_TEST_RABBITMQ not set");
         return;
     };
     let publisher = RabbitMqPublisher::connect(&url).await.unwrap();
@@ -258,8 +252,8 @@ async fn rabbitmq_report_publish_round_trip() {
         .unwrap();
 
     let mut rep = report("rep1", "clamd");
-    rep.report_dest = ReportDest::new(dest_queue.clone());
-    publisher.publish_report(&rep, &ReportDest::new(dest_queue.clone())).await.unwrap();
+    rep.report_dest = ReportDest::new(dest_queue.clone()).unwrap();
+    publisher.publish_report(&rep, &ReportDest::new(dest_queue.clone()).unwrap()).await.unwrap();
 
     let fetched = wait_for_async("report message", || {
         let channel = channel.clone();
@@ -287,7 +281,7 @@ async fn rabbitmq_report_publish_round_trip() {
 #[tokio::test]
 async fn nats_pubsub_and_ack() {
     let Some(url) = nats_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_NATS not set");
+        eprintln!("skipping: VS_SCAN_TEST_NATS not set");
         return;
     };
     let scanner = ScannerId::new(unique("it-clamd")).unwrap();
@@ -320,7 +314,7 @@ async fn nats_pubsub_and_ack() {
 #[tokio::test]
 async fn nats_publish_dedupe() {
     let Some(url) = nats_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_NATS not set");
+        eprintln!("skipping: VS_SCAN_TEST_NATS not set");
         return;
     };
     let scanner = ScannerId::new(unique("it-clamd")).unwrap();
@@ -350,9 +344,56 @@ async fn nats_publish_dedupe() {
 }
 
 #[tokio::test]
+async fn nats_fanout_reaches_every_scanner() {
+    // Regression: Nats-Msg-Id used to be the bare sample_id, so JetStream's
+    // stream-wide dedupe silently dropped every scanner request except the
+    // first - `--scanner all` reached exactly one scanner on NATS.
+    let Some(url) = nats_url() else {
+        eprintln!("skipping: VS_SCAN_TEST_NATS not set");
+        return;
+    };
+    let scanner_a = ScannerId::new(unique("it-clamd")).unwrap();
+    let scanner_b = ScannerId::new(unique("it-yara")).unwrap();
+    let listener_a = versa_scan_infra::inbound_adapters::bus::nats::NatsListener::connect(
+        &url,
+        Duration::from_secs(60),
+        3,
+    )
+    .await
+    .unwrap();
+    let listener_b = versa_scan_infra::inbound_adapters::bus::nats::NatsListener::connect(
+        &url,
+        Duration::from_secs(60),
+        3,
+    )
+    .await
+    .unwrap();
+    let publisher = NatsPublisher::connect(&url).await.unwrap();
+
+    let (mut rx_a, cancel_a, task_a) = spawn_listener(Arc::new(listener_a), scanner_a.clone());
+    let (mut rx_b, cancel_b, task_b) = spawn_listener(Arc::new(listener_b), scanner_b.clone());
+
+    let req = request("fanout-me", Priority::Normal);
+    publisher.publish_request(scanner_a.clone(), &req).await.unwrap();
+    publisher.publish_request(scanner_b.clone(), &req).await.unwrap();
+
+    let a = wait_for("delivery to scanner A", || rx_a.try_recv().ok()).await;
+    let b = wait_for("delivery to scanner B", || rx_b.try_recv().ok()).await;
+    assert_eq!(a.request.sample_id.as_str(), "fanout-me");
+    assert_eq!(b.request.sample_id.as_str(), "fanout-me");
+    a.handle.ack().await;
+    b.handle.ack().await;
+
+    cancel_a.cancel();
+    cancel_b.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), task_b).await;
+}
+
+#[tokio::test]
 async fn nats_nak_redelivers_with_attempt_count() {
     let Some(url) = nats_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_NATS not set");
+        eprintln!("skipping: VS_SCAN_TEST_NATS not set");
         return;
     };
     let scanner = ScannerId::new(unique("it-clamd")).unwrap();
@@ -384,7 +425,7 @@ async fn nats_nak_redelivers_with_attempt_count() {
 #[tokio::test]
 async fn nats_report_publish_reaches_subscriber() {
     let Some(url) = nats_url() else {
-        eprintln!("skipping: VERSA_SCAN_TEST_NATS not set");
+        eprintln!("skipping: VS_SCAN_TEST_NATS not set");
         return;
     };
     let publisher = NatsPublisher::connect(&url).await.unwrap();
@@ -396,7 +437,7 @@ async fn nats_report_publish_reaches_subscriber() {
     let mut sub = subscriber.subscribe(dest.clone()).await.unwrap();
 
     let rep = report("sub1", "debug");
-    publisher.publish_report(&rep, &ReportDest::new(dest.clone())).await.unwrap();
+    publisher.publish_report(&rep, &ReportDest::new(dest.clone()).unwrap()).await.unwrap();
 
     let message = tokio::time::timeout(Duration::from_secs(10), async move {
         use futures_util::StreamExt;

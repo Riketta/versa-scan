@@ -15,7 +15,6 @@
 //! false and the composition root refuses to select this scanner.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,27 +30,36 @@ use super::proc::kill_tree;
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 const SCAN_OVERHEAD: Duration = Duration::from_secs(120); // process start/teardown slack
+const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct DefenderScanner {
     id: ScannerId,
-    profile_cache: OnceLock<AvProfile>,
+    /// Scan budget (from `worker.scan_timeout_secs`); the spawned MpCmdRun
+    /// gets this plus spawn/teardown slack, so a big batch requeues at the
+    /// same timeout the orchestrator enforces instead of a fixed value.
+    scan_budget: Duration,
+    /// Degraded on purpose after a failed refresh (see `update`).
+    profile_cache: parking_lot::Mutex<Option<AvProfile>>,
 }
 
 impl Default for DefenderScanner {
     fn default() -> Self {
-        Self::new()
+        Self::new(Duration::from_secs(15 * 60))
     }
 }
 
 impl DefenderScanner {
-    pub fn new() -> Self {
+    pub fn new(scan_budget: Duration) -> Self {
         Self {
             id: ScannerId::new("defender").expect("static slug is valid"),
-            profile_cache: OnceLock::new(),
+            scan_budget,
+            profile_cache: parking_lot::Mutex::new(None),
         }
     }
 
     /// Newest platform-dir MpCmdRun, falling back to the install dir.
+    /// Version directories are compared numerically per dot segment
+    /// (`4.18.24050.7` > `4.18.9.0`, which a lexicographic sort inverts).
     fn resolve_mpcmdrun() -> Option<PathBuf> {
         let program_files =
             std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_owned());
@@ -60,13 +68,17 @@ impl DefenderScanner {
         )
         .join(r"Microsoft\Windows Defender\Platform");
         if let Ok(entries) = std::fs::read_dir(&candidates_root) {
-            let mut versions: Vec<PathBuf> = entries
+            let mut versions: Vec<(Vec<u64>, PathBuf)> = entries
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| p.join("MpCmdRun.exe").is_file())
+                .filter_map(|p| {
+                    let name = p.file_name()?.to_string_lossy().to_string();
+                    Some((version_key(&name), p))
+                })
                 .collect();
             versions.sort();
-            if let Some(newest) = versions.pop() {
+            if let Some((_, newest)) = versions.pop() {
                 return Some(newest.join("MpCmdRun.exe"));
             }
         }
@@ -100,18 +112,32 @@ impl DefenderScanner {
     }
 
     async fn powershell_status() -> Option<(String, String)> {
-        let output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(Get-MpComputerStatus).AMProductVersion; \
-                 (Get-MpComputerStatus).AntivirusSignatureVersion",
-            ])
-            .creation_flags_cfg()
-            .output()
-            .await
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "(Get-MpComputerStatus).AMProductVersion; \
+             (Get-MpComputerStatus).AntivirusSignatureVersion",
+        ]);
+        command.creation_flags_cfg();
+        let mut child = command.spawn().ok()?;
+        // A hung PowerShell must not wedge the pipeline (profile() runs on
+        // the scan path); kill and degrade to a version-less profile.
+        let status = match tokio::time::timeout(STATUS_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => status,
+            _ => {
+                let _ = child.kill().await;
+                return None;
+            }
+        };
+        let mut text = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            use tokio::io::AsyncReadExt as _;
+            let _ = stdout.read_to_string(&mut text).await;
+        }
+        if !status.success() {
+            return None;
+        }
         let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
         Some((lines.next()?.to_owned(), lines.next()?.to_owned()))
     }
@@ -179,8 +205,8 @@ impl ScannerPort for DefenderScanner {
     }
 
     async fn profile(&self) -> Result<AvProfile, ScannerError> {
-        if let Some(profile) = self.profile_cache.get() {
-            return Ok(profile.clone());
+        if let Some(profile) = self.profile_cache.lock().clone() {
+            return Ok(profile);
         }
         let mut profile =
             AvProfile { av_name: "Windows Defender".to_owned(), ..Default::default() };
@@ -188,7 +214,9 @@ impl ScannerPort for DefenderScanner {
             profile.av_version = Some(engine);
             profile.bases_version = Some(signature);
         }
-        let _ = self.profile_cache.set(profile.clone());
+        // Cached even when degraded - but `update()` clears the cache so the
+        // openbox role's refresh repopulates it.
+        *self.profile_cache.lock() = Some(profile.clone());
         Ok(profile)
     }
 
@@ -197,14 +225,14 @@ impl ScannerPort for DefenderScanner {
             return Err(ScannerError::NotInstalled("MpCmdRun.exe not found".to_owned()));
         };
         let dir_str = dir.to_string_lossy().to_string();
-        let timeout = SPAWN_TIMEOUT + SCAN_OVERHEAD;
+        let timeout = SPAWN_TIMEOUT + SCAN_OVERHEAD + self.scan_budget;
         let output =
             Self::run_mpcmdrun(&exe, &["-Scan", "-ScanType", "3", "-File", &dir_str], timeout)
                 .await?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let code = output.status.code().unwrap_or(-1);
 
-        let mut entries = Self::parse_scan_output(&stdout);
+        let mut parsed = Self::parse_scan_output(&stdout);
         match code {
             0 | 2 => {}
             other => {
@@ -213,6 +241,15 @@ impl ScannerPort for DefenderScanner {
                     String::from_utf8_lossy(&output.stderr).trim()
                 )));
             }
+        }
+        // Fail closed: exit 2 means Defender saw threats. If the parser
+        // drifted and extracted none, reporting Clean would hide malware.
+        if code == 2 && parsed.is_empty() {
+            return Err(ScannerError::ScanFailed(
+                "MpCmdRun reported threats (exit 2) but no findings could be parsed; \
+                 refusing to report clean"
+                    .to_owned(),
+            ));
         }
         if stdout.contains("ERROR:") {
             return Err(ScannerError::ScanFailed(format!(
@@ -228,11 +265,11 @@ impl ScannerPort for DefenderScanner {
         for file in files {
             let name =
                 file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if !entries.iter().any(|(n, _)| *n == name) {
-                entries.push((name, FileVerdict::default()));
+            if !parsed.iter().any(|(n, _)| *n == name) {
+                parsed.push((name, FileVerdict::default()));
             }
         }
-        Ok(ScanOutput { entries })
+        Ok(ScanOutput { entries: parsed })
     }
 
     async fn update(&self) -> Result<UpdateOutcome, ScannerError> {
@@ -252,12 +289,29 @@ impl ScannerPort for DefenderScanner {
                 text.trim()
             )));
         }
+        // The profile cache may hold a stale (or degraded) snapshot from
+        // before the refresh - drop it so the next scan re-probes.
+        *self.profile_cache.lock() = None;
         if text.to_lowercase().contains("already") || text.to_lowercase().contains("up to date") {
             Ok(UpdateOutcome::UpToDate)
         } else {
             Ok(UpdateOutcome::Updated)
         }
     }
+}
+
+/// `1.2.3.4` -> `[1, 2, 3, 4]` for numeric ordering of platform dirs.
+fn version_key(name: &str) -> Vec<u64> {
+    name.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect()
+}
+
+/// Pure: why a threats-found scan must fail closed (parse drift would
+/// otherwise turn real detections into silent Clean verdicts).
+fn fail_closed_reason(exit_code: i32, parsed_findings: usize) -> Option<String> {
+    (exit_code == 2 && parsed_findings == 0).then(|| {
+        "MpCmdRun reported threats (exit 2) but no findings could be parsed;          refusing to report clean"
+            .to_owned()
+    })
 }
 
 #[cfg(test)]
@@ -322,10 +376,31 @@ No threats found.";
     async fn off_windows_probe_fails_gracefully() {
         // On Windows this resolves the real binary (installed on runners/VMs);
         // elsewhere it must simply report "not installed" without erroring.
-        let scanner = DefenderScanner::new();
+        let scanner = DefenderScanner::new(Duration::from_secs(60));
         let installed = scanner.is_installed().await.unwrap();
         #[cfg(not(windows))]
         assert!(!installed);
         let _ = installed;
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+    #[test]
+    fn platform_versions_sort_numerically() {
+        // A lexicographic sort would prefer 4.18.9.0 over 4.18.24050.7.
+        assert!(version_key("4.18.24050.7") > version_key("4.18.9.0"));
+        assert!(version_key("1.10.0") > version_key("1.9.0"));
+    }
+
+    #[test]
+    fn threats_without_parsed_findings_fail_closed() {
+        assert!(fail_closed_reason(2, 0).is_some(), "exit 2 + zero parsed = refuse clean");
+        assert!(fail_closed_reason(0, 0).is_none(), "clean scan needs no findings");
+        assert!(fail_closed_reason(2, 1).is_none(), "parsed findings are enough");
     }
 }

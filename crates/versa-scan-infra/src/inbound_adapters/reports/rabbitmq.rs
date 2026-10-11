@@ -43,7 +43,8 @@ struct RabbitReportStream {
 
 impl RabbitReportStream {
     fn decode(delivery: &LapinDelivery) -> Result<IncomingReport, String> {
-        let dest = ReportDest::new(delivery.routing_key.as_str());
+        let dest = ReportDest::new(delivery.routing_key.as_str())
+            .map_err(|e| format!("report dest: {e}"))?;
         let dto: ScanReportV1 =
             serde_json::from_slice(&delivery.data).map_err(|e| format!("json: {e}"))?;
         let report = dto.to_model(dest.clone()).map_err(|e| e.to_string())?;

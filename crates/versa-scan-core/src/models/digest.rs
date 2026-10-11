@@ -28,6 +28,16 @@ impl Sha256Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+    /// Lowercase hex for arbitrary bytes (store keys, log lines). Shared so
+    /// adapters stop re-implementing it byte-by-byte.
+    pub fn to_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
 }
 
 impl fmt::Display for Sha256Digest {

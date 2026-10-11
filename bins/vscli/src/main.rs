@@ -143,7 +143,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Command::Serve { bind } => {
-            server::serve(store, &bind).await?;
+            server::serve(store, &bind, &config.artifact_token()).await?;
             Ok(())
         }
         Command::Reports { sample_id } => {
@@ -197,19 +197,35 @@ async fn submit(
             bail!("not a file: {}", path.display());
         }
     }
+    // Fail on typos up front: a misspelled slug publishes into a queue no
+    // worker will ever consume (and declares it on RabbitMQ).
+    for scanner in &scanners {
+        if scanner != "all" && !KNOWN_SCANNERS.contains(&scanner.as_str()) {
+            bail!("unknown scanner {scanner:?} (known: all, {})", KNOWN_SCANNERS.join(", "));
+        }
+    }
 
     let publishers = bus::connect(&config.bus).await.context("bus connect (publishers)")?;
     let waiter = if wait { Some(reports::connect(&config.bus).await?) } else { None };
 
-    // The embedded artifact server must be up before workers fetch; it dies
-    // with the submit session (use `vscli serve` for a persistent store).
-    let server_task = {
+    // The embedded artifact server must be up (and bound!) before workers
+    // fetch; it dies with the submit session (use `vscli serve` for a
+    // persistent store). Bind failure used to surface as inexplicable
+    // "no report" timeouts - fail loudly instead.
+    let mut server_task = {
         let store = Arc::clone(store);
         let bind = bind.to_owned();
-        tokio::spawn(async move { server::serve(store, &bind).await })
+        let token = config.artifact_token();
+        tokio::spawn(async move { server::serve(store, &bind, &token).await })
     };
-    // Give the listener a beat to bind before the first request can race it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait a beat for the bind outcome: an unbindable port used to surface
+    // much later as inexplicable "no report" timeouts.
+    match tokio::time::timeout(Duration::from_millis(250), &mut server_task).await {
+        Err(_elapsed) => {} // still serving: bound successfully
+        Ok(Ok(Ok(()))) => bail!("artifact server exited immediately"),
+        Ok(Ok(Err(io))) => bail!("artifact server failed to bind {bind}: {io}"),
+        Ok(Err(join)) => bail!("artifact server task panicked: {join}"),
+    }
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (dest_for, wait_dest): (Arc<dyn Fn(&SampleId) -> ReportDest + Send + Sync>, ReportDest) =
@@ -222,17 +238,22 @@ async fn submit(
                             &closure_session,
                             id,
                         ))
+                        .expect("generated report dests are valid")
                     }),
                     ReportDest::new(versa_scan_infra::wire::nats_report_session_wildcard(
                         &session_id,
-                    )),
+                    ))
+                    .expect("generated report dests are valid"),
                 )
             }
             versa_scan_infra::config::BusBackend::RabbitMq => {
                 let queue = versa_scan_infra::wire::rabbitmq_report_queue(&session_id);
                 (
-                    Arc::new(move |_id: &SampleId| ReportDest::new(queue.clone())),
-                    ReportDest::new(versa_scan_infra::wire::rabbitmq_report_queue(&session_id)),
+                    Arc::new(move |_id: &SampleId| {
+                        ReportDest::new(queue.clone()).expect("generated report dests are valid")
+                    }),
+                    ReportDest::new(versa_scan_infra::wire::rabbitmq_report_queue(&session_id))
+                        .expect("generated report dests are valid"),
                 )
             }
         };
@@ -242,6 +263,7 @@ async fn submit(
         publishers.request.clone(),
         waiter,
         advertise.to_owned(),
+        config.artifact_token(),
         dest_for,
         wait_dest,
     );

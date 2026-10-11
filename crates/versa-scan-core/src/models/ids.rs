@@ -10,6 +10,12 @@ pub struct InvalidId {
     reason: String,
 }
 
+impl InvalidId {
+    pub(crate) fn new(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into() }
+    }
+}
+
 fn validate(value: &str, kind: &str) -> Result<(), InvalidId> {
     if value.is_empty() {
         return Err(InvalidId { reason: format!("{kind} must not be empty") });
@@ -19,6 +25,17 @@ fn validate(value: &str, kind: &str) -> Result<(), InvalidId> {
     }
     if value.chars().any(char::is_whitespace) {
         return Err(InvalidId { reason: format!("{kind} must not contain whitespace") });
+    }
+    // Ids surface as filesystem names (workspace files) and NATS subject
+    // tokens, so the charset is deliberately narrow: no path separators,
+    // no drive/colon syntax, no shell-hostile characters. Dots are allowed
+    // inside the value (file names like `eicar2.bin` are ids too), but the
+    // dot-only values are rejected - `.join("..")` escapes directories.
+    if !value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        return Err(InvalidId { reason: format!("{kind} must only contain [A-Za-z0-9._-]") });
+    }
+    if value == "." || value == ".." {
+        return Err(InvalidId { reason: format!("{kind} must not be a dot-only value") });
     }
     Ok(())
 }
@@ -98,5 +115,36 @@ mod tests {
         let id = SampleId::new("abc-123").unwrap();
         assert_eq!(id.to_string(), "abc-123");
         assert_eq!(id.as_str(), "abc-123");
+    }
+
+    #[test]
+    fn rejects_path_traversal_shapes() {
+        // Ids become workspace file names - separators, escapes, and drive
+        // syntax must never reach the filesystem.
+        for hostile in [
+            "..",
+            ".",
+            "../evil",
+            "..\\\\evil",
+            "a/b",
+            "a\\\\b",
+            "C:\\evil",
+            "file:empty",
+            "a|b",
+            "a;b",
+            "a$b",
+        ] {
+            assert!(SampleId::new(hostile).is_err(), "must reject {hostile:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_plain_file_name_ids() {
+        // Dots inside names are fine (vscli-generated uuids and human-named
+        // ids like `eicar2.bin` both work); only separators and dot-only
+        // values are excluded.
+        for fine in ["abc-123", "eicar2.bin", "4c1b...uuid-like", "UPPER.lower"] {
+            assert!(SampleId::new(fine).is_ok(), "must accept {fine:?}");
+        }
     }
 }

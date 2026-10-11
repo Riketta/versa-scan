@@ -66,7 +66,8 @@ impl ReportsLog {
             }
             let entry: LogEntry = serde_json::from_str(&line)
                 .map_err(|e| ReportsLogError::Corrupt { line: index + 1, reason: e.to_string() })?;
-            let dest = ReportDest::new(entry.dest);
+            let dest = ReportDest::new(&entry.dest)
+                .map_err(|e| ReportsLogError::Corrupt { line: index + 1, reason: e.to_string() })?;
             let report = entry
                 .report
                 .to_model(dest)
@@ -93,7 +94,7 @@ mod tests {
             sample_id: SampleId::new(sample).unwrap(),
             correlation_id: CorrelationId::new("c").unwrap(),
             scanner: ScannerId::new("clamd").unwrap(),
-            report_dest: ReportDest::new(dest),
+            report_dest: ReportDest::new(dest).expect("stored dests are validated at publish time"),
             worker: WorkerInfo {
                 hostname: "h".to_owned(),
                 os: "os".to_owned(),

@@ -34,6 +34,21 @@ max_file_size = 524288000  # 500 MiB
 # Cooldown after "scanner unavailable" before the worker retries.
 scanner_unavailable_backoff_secs = 10
 
+# Bounded scanner-unavailable retries: after this many attempts, samples in
+# the stuck batch get error reports ("scanner unavailable") instead of
+# looping forever. Higher than the fetch/publish cap (3) on purpose.
+scanner_max_attempts = 10
+
+# Seconds to wait for the pipeline's final flush after the shutdown signal.
+# The final flush requeues instead of scanning new batches, so this stays
+# small.
+shutdown_grace_secs = 10
+
+# Fetch-host allowlist (host or host:port entries). Empty = fetch whatever
+# URL the bus carries; set it to your artifact server's address so workers
+# cannot be pointed at arbitrary hosts.
+fetch_allowed_hosts = []
+
 [bus]
 # "rabbitmq" or "nats".
 backend = "rabbitmq"
@@ -66,6 +81,12 @@ max_deliver = 3
 # Feed files: one sha256 per line, `#` comments, optional label after the
 # hash. Scans pick up changed files automatically; `update()` re-reads.
 # feeds = ["feeds/malwarebazaar.sha256"]
+
+# [artifact]
+# Bearer token protecting the embedded artifact server: vscli appends it to
+# every sample URL (`?token=...`) and rejects requests without it. Empty =
+# open server (fine for loopback-only dev; loud warning otherwise).
+# token = "change-me"
 
 [self_update]
 enabled = false

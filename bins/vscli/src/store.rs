@@ -55,10 +55,7 @@ impl SampleStore {
         let mut hasher = sha2::Sha256::new();
         hasher.update(bytes);
         let digest: Vec<u8> = hasher.finalize().to_vec();
-        let mut sha256 = String::with_capacity(digest.len() * 2);
-        for byte in &digest {
-            sha256.push_str(&format!("{byte:02x}"));
-        }
+        let sha256 = versa_scan_core::models::digest::Sha256Digest::to_hex(&digest);
 
         let path = self.path_for(&sha256);
         if path.is_file() {

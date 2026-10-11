@@ -56,7 +56,8 @@ struct NatsReportStream {
 
 impl NatsReportStream {
     fn decode(message: async_nats::jetstream::Message) -> Result<IncomingReport, String> {
-        let dest = ReportDest::new(message.subject.as_str());
+        let dest = ReportDest::new(message.subject.as_str())
+            .map_err(|e| format!("report subject: {e}"))?;
         let dto: ScanReportV1 =
             serde_json::from_slice(&message.payload).map_err(|e| format!("json: {e}"))?;
         let report = dto.to_model(dest.clone()).map_err(|e| e.to_string())?;

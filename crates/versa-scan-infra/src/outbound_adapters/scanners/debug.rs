@@ -89,20 +89,6 @@ fn verdict_extras(name: &str) -> FileVerdict {
     }
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
-    let mut entries = std::fs::read_dir(dir)?;
-    while let Some(entry) = entries.next() {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 impl Default for DebugScanner {
     fn default() -> Self {
         Self::new()
@@ -130,7 +116,7 @@ impl ScannerPort for DebugScanner {
 
     async fn scan(&self, dir: &Path) -> Result<ScanOutput, ScannerError> {
         let mut files = Vec::new();
-        collect_files(dir, &mut files).map_err(|e| ScannerError::Io(format!("debug walk: {e}")))?;
+        super::collect_files_recursive(dir, &mut files);
         files.sort();
 
         for file in &files {

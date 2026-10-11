@@ -56,7 +56,7 @@ async fn main() -> ExitCode {
     versa_scan_infra::observability::init(cli.debug);
 
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             tracing::error!(error = %err, "vsd failed");
             eprintln!("error: {err:#}");
@@ -65,19 +65,22 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let config = Configuration::load(cli.config.as_deref())?;
+    config.validate()?;
     if cli.detect {
         scanner_registry::detect(&config).await;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     if let Some(command) = cli.command {
         let updater = build_updater(&config)?;
         return match command {
-            Command::UpdateCheck => update_check(updater).await,
-            Command::UpdateApply => update_apply(updater).await,
-            Command::InstallTask => vsd::install::install().await,
+            Command::UpdateCheck => update_check(updater).await.map(|()| ExitCode::SUCCESS),
+            Command::UpdateApply => update_apply(updater).await.map(|()| ExitCode::SUCCESS),
+            Command::InstallTask => {
+                vsd::install::install(cli.config.as_deref()).await.map(|()| ExitCode::SUCCESS)
+            }
         };
     }
 
@@ -99,9 +102,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     tokio::spawn(watch_shutdown(cancel.clone()));
 
     match role {
-        WorkerRole::Sandbox => run_sandbox(config, scanner, updater, worker_info, cancel).await,
+        WorkerRole::Sandbox => {
+            run_sandbox(config, scanner, updater, worker_info, cancel).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         WorkerRole::Openbox => {
-            vsd::openbox::run_with_config(&config, scanner, updater, worker_info, cancel).await
+            let restart =
+                vsd::openbox::run_with_config(&config, scanner, updater, worker_info, cancel)
+                    .await?;
+            if restart {
+                tracing::info!(
+                    code = vsd::openbox::RESTART_EXIT_CODE,
+                    "exiting with the restart code so the service manager starts the new version"
+                );
+                Ok(ExitCode::from(vsd::openbox::RESTART_EXIT_CODE))
+            } else {
+                Ok(ExitCode::SUCCESS)
+            }
         }
     }
 }
@@ -162,6 +179,7 @@ async fn run_sandbox(
         HttpFetcher::new(
             Duration::from_secs(config.worker.fetch_timeout_secs),
             config.worker.max_file_size,
+            config.fetch_allowed_hosts(),
         )
         .map_err(anyhow::Error::msg)?,
     );
@@ -187,9 +205,11 @@ async fn run_sandbox(
     tracing::info!(scanner = %scanner.id().as_str(), "consuming scan requests");
     listener.run(scanner.id(), orchestrator, cancel).await;
 
-    // Listener ended (shutdown signal): give the pipeline a moment to
-    // finish its final flush.
-    let _ = tokio::time::timeout(Duration::from_secs(10), pipeline_task).await;
+    // Listener ended (shutdown signal): give the pipeline a bounded moment
+    // to finish its final flush (configurable; the final flush itself is
+    // cancellation-aware and requeues instead of scanning new batches).
+    let grace = Duration::from_secs(config.shutdown_grace_secs());
+    let _ = tokio::time::timeout(grace, pipeline_task).await;
     tracing::info!("vsd stopped");
     Ok(())
 }

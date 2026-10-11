@@ -3,7 +3,7 @@
 //! Ensures both streams exist (`VS_SCAN_REQUESTS` workqueue over
 //! `vs.scan.requests.>`, `VS_SCAN_REPORTS` limits-retention over
 //! `vs.scan.reports.>`), then publishes with `Nats-Msg-Id` dedupe:
-//! requests dedupe on `<sample_id>`, reports on
+//! requests dedupe on `<sample_id>.<scanner>`, reports on
 //! `<sample_id>.<scanner>.<attempt>` (worker-side republish dedupe).
 //! Priority is a deliberate no-op on NATS (docs/DESIGN.md).
 
@@ -97,8 +97,13 @@ impl RequestPublisherPort for NatsPublisher {
         let payload = serde_json::to_vec(&dto)
             .map_err(|e| PublishError::Publish(format!("request serialize: {e}")))?;
         let subject = format!("vs.scan.requests.{}", scanner.as_str());
-        self.publish_json_with_msg_id(&subject, request.sample_id.as_str().to_owned(), &payload)
-            .await
+        // Dedupe key must include the scanner: `--scanner all` publishes one
+        // request per scanner with the same sample_id, and JetStream dedupe
+        // is stream-wide on Nats-Msg-Id. Scanner slugs are dot-free, so the
+        // composite stays unambiguous (sample ids are charset-validated and
+        // dot-tolerant, scanner is always the last token).
+        let msg_id = format!("{}.{}", request.sample_id.as_str(), scanner.as_str());
+        self.publish_json_with_msg_id(&subject, msg_id, &payload).await
     }
 }
 

@@ -208,14 +208,6 @@ impl HashBlocklistScanner {
     }
 }
 
-fn hex(digest: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    digest.iter().fold(String::with_capacity(64), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
-}
-
 /// Streams `path` through sha256; returns the digest.
 fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     use std::io::Read as _;
@@ -234,7 +226,7 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
 }
 
 fn detection_name(digest: &[u8; 32], set: &FeedSet) -> String {
-    let base = format!("sha256:{}", hex(digest));
+    let base = format!("sha256:{}", versa_scan_core::models::digest::Sha256Digest::to_hex(digest));
     match set.labels.get(digest) {
         Some(label) => format!("{base} ({label})"),
         None => base,
@@ -401,7 +393,8 @@ mod tests {
         let evil_path = samples.join("evil.bin");
         std::fs::write(&evil_path, b"evil content").unwrap();
 
-        let evil = hex(&hash_file(&evil_path).unwrap());
+        let evil =
+            versa_scan_core::models::digest::Sha256Digest::to_hex(&hash_file(&evil_path).unwrap());
         std::fs::write(&feed, format!("{evil}  Emotet loader\n")).unwrap();
 
         let scanner = HashBlocklistScanner::new(vec![feed]);
@@ -452,7 +445,8 @@ mod tests {
         let samples = tmp_dir("samples");
         let evil_path = samples.join("evil.bin");
         std::fs::write(&evil_path, b"evil content").unwrap();
-        let evil = hex(&hash_file(&evil_path).unwrap());
+        let evil =
+            versa_scan_core::models::digest::Sha256Digest::to_hex(&hash_file(&evil_path).unwrap());
 
         let scanner = HashBlocklistScanner::new(vec![feed.clone()]);
         let first = scanner.scan(&samples).await.unwrap();

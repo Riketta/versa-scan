@@ -48,6 +48,11 @@ pub struct OrchestratorSettings {
     pub fetch_concurrency: usize,
     /// Cooldown after a scanner-unavailable failure before the next batch.
     pub scanner_backoff: Duration,
+    /// Attempt cap for scanner-unavailable batches before they get error
+    /// reports. Higher than the fetch/publish cap: an AV daemon restart is
+    /// worth tolerating longer, but it is still bounded (nothing loops
+    /// forever).
+    pub scanner_max_attempts: u8,
 }
 
 impl Default for OrchestratorSettings {
@@ -58,9 +63,20 @@ impl Default for OrchestratorSettings {
             scan_timeout: Duration::from_secs(15 * 60),
             fetch_concurrency: 4,
             scanner_backoff: Duration::from_secs(10),
+            scanner_max_attempts: crate::services::retry::RetryPolicy::DEFAULT_SCANNER_MAX_ATTEMPTS,
         }
     }
 }
+
+/// How long a twin delivery (duplicate of one still being processed) waits
+/// before its redelivery. Delayed, not discarded: the original normally
+/// settles first, and discarding would lose the sample if the original's
+/// worker died right after.
+pub const TWIN_REQUEUE_DELAY: Duration = Duration::from_secs(60);
+
+/// Upper bound for the per-batch `profile()` call. Metadata must never stall
+/// the pipeline; a slow engine degrades reports (`av: None`) instead.
+const PROFILE_TIMEOUT_CAP: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
@@ -102,12 +118,13 @@ impl Orchestrator {
     ) -> Result<Self, OrchestratorError> {
         let workspace = WorkspaceManager::new(workspace_root)?;
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let retry = RetryPolicy::default().with_scanner_max_attempts(settings.scanner_max_attempts);
         Ok(Self {
             scanner,
             fetcher,
             report_publisher,
             workspace,
-            retry: RetryPolicy::default(),
+            retry,
             settings,
             worker,
             events_tx,
@@ -199,9 +216,9 @@ impl Orchestrator {
         if ledger.contains_key(&id) || planner.contains(&id) {
             tracing::warn!(
                 sample_id = %id,
-                "duplicate delivery while original is in flight; discarding twin"
+                "duplicate delivery while original is in flight; delaying its redelivery"
             );
-            delivery.handle.discard().await;
+            delivery.handle.nak_delay(TWIN_REQUEUE_DELAY).await;
             return;
         }
         let Delivery { request, attempt, handle } = delivery;
@@ -256,13 +273,21 @@ impl Orchestrator {
         let workspace = match self.workspace.create(&batch) {
             Ok(workspace) => workspace,
             Err(err) => {
-                tracing::error!(error = %err, "cannot create batch workspace; requeueing");
+                tracing::error!(error = %err, "cannot create batch workspace; requeueing batch");
                 self.drain_nak(ledger).await;
                 return;
             }
         };
 
         let files = batch.files().to_vec();
+
+        // Cancellation between phases: unstarted work goes back to the
+        // broker instead of burning the shutdown grace on a fresh scan.
+        if cancel.is_cancelled() {
+            self.requeue_files(&files, ledger).await;
+            return;
+        }
+
         let fetched = self.fetch_files(&files, &workspace).await;
 
         let mut ok_files: Vec<BatchFile> = Vec::new();
@@ -273,15 +298,28 @@ impl Orchestrator {
             }
         }
 
+        if cancel.is_cancelled() {
+            self.requeue_files(&ok_files, ledger).await;
+            return; // workspace drop cleans up
+        }
+
         if ok_files.is_empty() {
             tracing::info!(batch_id = %batch.id(), "no files fetched; batch skipped");
             return; // workspace drop cleans up
         }
 
-        let av = match self.scanner.profile().await {
-            Ok(profile) => Some(profile),
-            Err(err) => {
+        let profile_timeout = self.settings.scan_timeout.min(PROFILE_TIMEOUT_CAP);
+        let av = match tokio::time::timeout(profile_timeout, self.scanner.profile()).await {
+            Ok(Ok(profile)) => Some(profile),
+            Ok(Err(err)) => {
                 tracing::warn!(error = %err, "scanner profile unavailable; reports omit AV info");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?profile_timeout,
+                    "scanner profile timed out; reports omit AV info"
+                );
                 None
             }
         };
@@ -294,22 +332,32 @@ impl Orchestrator {
 
         match scan {
             Err(_) => {
-                tracing::error!(
-                    batch_id = %batch.id(),
-                    timeout = ?self.settings.scan_timeout,
-                    "scan timed out; requeueing batch"
-                );
-                self.requeue_files(&ok_files, ledger).await;
-                sleep_cancel(cancel, self.settings.scanner_backoff).await;
+                self.settle_scanner_unavailable(
+                    &batch,
+                    &ok_files,
+                    ledger,
+                    av.clone(),
+                    started_at,
+                    format!("scan timed out after {:?}", self.settings.scan_timeout),
+                    cancel,
+                )
+                .await;
             }
             Ok(Err(
                 err @ (ScannerError::Unavailable(_)
                 | ScannerError::NotInstalled(_)
                 | ScannerError::Io(_)),
             )) => {
-                tracing::error!(error = %err, "scanner unavailable; requeueing batch");
-                self.requeue_files(&ok_files, ledger).await;
-                sleep_cancel(cancel, self.settings.scanner_backoff).await;
+                self.settle_scanner_unavailable(
+                    &batch,
+                    &ok_files,
+                    ledger,
+                    av.clone(),
+                    started_at,
+                    err.to_string(),
+                    cancel,
+                )
+                .await;
             }
             Ok(Err(err)) => {
                 tracing::error!(error = %err, "scan failed; reporting error per sample");
@@ -385,7 +433,14 @@ impl Orchestrator {
             .map(|file| {
                 let fetcher = Arc::clone(&fetcher);
                 let dest = workspace.files_dir().join(&file.local_name);
+                // Defense in depth: SampleId is charset-validated at the
+                // wire, but a hostile local_name must never escape the
+                // batch workspace (id ".." or an absolute path would).
+                let in_workspace = dest.starts_with(workspace.files_dir());
                 async move {
+                    if !in_workspace {
+                        return (file, Err(FetchError::Forbidden));
+                    }
                     let result = fetcher.fetch(&file.request, &dest).await;
                     (file, result)
                 }
@@ -478,6 +533,45 @@ impl Orchestrator {
                     }
                 }
             }
+        }
+    }
+
+    /// The scanner could not run (daemon down, service starting, batch
+    /// timed out). Bounded requeue via the retry policy's scanner cap -
+    /// exhaust it and the samples get error reports instead of looping
+    /// forever. Backs off once when anything was requeued.
+    async fn settle_scanner_unavailable(
+        &self,
+        batch: &crate::models::batch::ScanBatch,
+        files: &[BatchFile],
+        ledger: &mut HashMap<SampleId, DeliveryRecord>,
+        av: Option<crate::models::av::AvProfile>,
+        started_at: OffsetDateTime,
+        detail: String,
+        cancel: &CancellationToken,
+    ) {
+        tracing::warn!(batch_id = %batch.id(), reason = %detail, "scanner unavailable; applying retry policy");
+        let mut requeued = 0usize;
+        for file in files {
+            let attempt = ledger.get(&file.request.sample_id).map_or(1, |record| record.attempt);
+            let disposition =
+                self.retry.decide(&Failure::ScannerUnavailable(detail.clone()), attempt);
+            match disposition {
+                Disposition::Requeue => {
+                    if let Some(record) = ledger.remove(&file.request.sample_id) {
+                        record.handle.nak_requeue().await;
+                        requeued += 1;
+                    }
+                }
+                Disposition::Terminal { message } => {
+                    let report =
+                        self.error_report(&file.request, av.clone(), message, started_at, attempt);
+                    self.settle_report(&file.request, report, ledger).await;
+                }
+            }
+        }
+        if requeued > 0 {
+            sleep_cancel(cancel, self.settings.scanner_backoff).await;
         }
     }
 
@@ -672,7 +766,7 @@ mod tests {
             sha256: Sha256Digest::from_hex(DIGEST).unwrap(),
             size: 13,
             priority: Priority::Normal,
-            report_dest: ReportDest::new("reports"),
+            report_dest: ReportDest::new("reports").unwrap(),
             correlation_id: CorrelationId::new("corr").unwrap(),
             extensions: vec![],
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -698,6 +792,7 @@ mod tests {
             scan_timeout: Duration::from_secs(5),
             fetch_concurrency: 2,
             scanner_backoff: Duration::from_millis(10),
+            scanner_max_attempts: 3,
         }
     }
 
@@ -977,7 +1072,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_delivery_twin_is_discarded() {
+    async fn scanner_unavailable_reports_errors_at_attempt_cap() {
+        let mut outputs = VecDeque::new();
+        outputs.push_back(Err(ScannerError::Unavailable("clamd down".to_owned())));
+        let rig = rig(outputs, HashMap::new(), false);
+
+        // settings() caps scanner attempts at 3; attempt 3 is the last straw.
+        let h1 = FakeHandle::default();
+        let h2 = FakeHandle::default();
+        drive(
+            &rig,
+            vec![delivery("a", 3, h1.clone()), delivery("b", 3, h2.clone())],
+            &[h1.clone(), h2.clone()],
+        )
+        .await;
+
+        let reports = rig.reports.lock();
+        assert_eq!(reports.len(), 2, "terminal error reports at the cap");
+        for report in reports.iter() {
+            match &report.outcome {
+                ScanOutcome::Error { message } => {
+                    assert!(message.contains("scanner unavailable"), "{message}")
+                }
+                other => panic!("expected error outcome, got {other:?}"),
+            }
+        }
+        drop(reports);
+        assert_eq!(h1.ops(), vec!["ack"]);
+        assert_eq!(h2.ops(), vec!["ack"]);
+    }
+
+    #[tokio::test]
+    async fn duplicate_delivery_twin_is_delayed_not_discarded() {
         let mut outputs = VecDeque::new();
         outputs.push_back(Ok(clean_output(&["a"])));
         let rig = rig(outputs, HashMap::new(), false);
@@ -995,6 +1121,8 @@ mod tests {
         assert_eq!(reports.len(), 1, "one scan, one report");
         drop(reports);
         assert_eq!(first.ops(), vec!["ack"]);
-        assert_eq!(twin.ops(), vec!["discard"]);
+        // Delayed requeue, not discard: if the original's worker died right
+        // after settling, discarding the twin would lose the sample.
+        assert_eq!(twin.ops(), vec!["nak"]);
     }
 }

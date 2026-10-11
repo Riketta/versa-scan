@@ -27,6 +27,9 @@ jobs:
       # run only where these env vars are set - Linux. Windows skips them.
       rabbitmq:
         image: rabbitmq:3.13
+        env:
+          RABBITMQ_DEFAULT_USER: versa
+          RABBITMQ_DEFAULT_PASS: versa
         ports:
           - 5672:5672
         options: >-
@@ -50,13 +53,20 @@ jobs:
         run: cargo +1.98 fmt --all -- --check
 
       - name: Clippy (deny-level lints gate)
-        run: cargo +1.98 clippy --all-targets
+        run: cargo +1.98 clippy --all-targets --locked
+
+      # Broker integration tests: service containers are Linux-only, so the
+      # env (which opts the tests in) must not be set on the Windows leg.
+      - name: Tests (broker integration, Linux)
+        if: runner.os == 'Linux'
+        env:
+          VS_SCAN_TEST_RABBITMQ: amqp://versa:versa@localhost:5672/%2f
+          VS_SCAN_TEST_NATS: nats://localhost:4222
+        run: cargo +1.98 test --locked
 
       - name: Tests
-        env:
-          VERSA_SCAN_TEST_RABBITMQ: amqp://versa:versa@localhost:5672/%2f
-          VERSA_SCAN_TEST_NATS: nats://localhost:4222
-        run: cargo +1.98 test
+        if: runner.os != 'Linux'
+        run: cargo +1.98 test --locked
 
       - name: Build release binaries
         run: cargo +1.98 build --release

@@ -35,7 +35,7 @@ pub(crate) async fn download_extract_swap_with_bytes(
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
         hasher.update(archive);
-        let actual = hex_encode(&hasher.finalize());
+        let actual = versa_scan_core::models::digest::Sha256Digest::to_hex(&hasher.finalize());
         if actual != expected_sha256.as_str() {
             return Err(UpdateError::HashMismatch {
                 expected: expected_sha256.clone(),
@@ -69,7 +69,7 @@ async fn download(
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(&bytes);
-    let actual = hex_encode(&hasher.finalize());
+    let actual = versa_scan_core::models::digest::Sha256Digest::to_hex(&hasher.finalize());
     if actual != expected_sha256.as_str() {
         return Err(UpdateError::HashMismatch {
             expected: expected_sha256.clone(),
@@ -150,10 +150,17 @@ fn swap_binary(staging: &Path, current_exe: &Path) -> Result<(), UpdateError> {
 
     #[cfg(not(windows))]
     {
-        std::fs::copy(&new_exe, current_exe)
-            .map_err(|e| UpdateError::Swap(format!("replace exe: {e}")))?;
+        // Writing onto the running image fails with ETXTBSY on Linux; copy
+        // to a sibling name and rename over - rename replaces a running
+        // executable atomically.
+        let staged = current_exe.with_extension("new");
+        let _ = std::fs::remove_file(&staged);
+        std::fs::copy(&new_exe, &staged)
+            .map_err(|e| UpdateError::Swap(format!("stage new exe: {e}")))?;
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(current_exe, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+        std::fs::rename(&staged, current_exe)
+            .map_err(|e| UpdateError::Swap(format!("replace exe: {e}")))?;
     }
 
     tracing::info!(
@@ -176,14 +183,6 @@ fn find_file_recursive(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
         }
     }
     dirs.into_iter().find_map(|sub| find_file_recursive(&sub, name))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }
 
 #[cfg(test)]

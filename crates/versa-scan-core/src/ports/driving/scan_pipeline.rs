@@ -21,6 +21,12 @@ pub trait DeliveryHandle: Send + Sync {
     async fn nak_requeue(&self);
     /// Permanent failure on our side: do not redeliver.
     async fn discard(&self);
+    /// Redeliver later without burning an attempt now (a twin delivery whose
+    /// original is still being processed). Backends without delayed naks
+    /// fall back to an immediate requeue.
+    async fn nak_delay(&self, _delay: std::time::Duration) {
+        self.nak_requeue().await;
+    }
 }
 
 /// One consumed scan request plus its settlement handle and the broker's

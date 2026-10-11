@@ -12,6 +12,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use std::collections::HashMap;
+
+use axum::extract::Query;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use versa_scan_core::models::digest::Sha256Digest;
 
@@ -19,15 +22,51 @@ use crate::store::SampleStore;
 
 const STREAM_THRESHOLD: u64 = 1024 * 1024;
 
-pub fn router(store: Arc<SampleStore>) -> Router {
-    Router::new().route("/samples/{sha}", get(get_sample).head(head_sample)).with_state(store)
+/// Shared server state: the store plus the optional bearer token. When a
+/// token is configured, every request must carry it as `?token=`; samples
+/// are guessable by sha256 otherwise (the request URLs travel the bus in
+/// plaintext, so this is transport-level hygiene, not a security boundary).
+#[derive(Clone)]
+pub struct ArtifactState {
+    store: Arc<SampleStore>,
+    token: Option<String>,
 }
 
-/// Runs until the process is stopped; call from a spawned task.
-pub async fn serve(store: Arc<SampleStore>, bind: &str) -> std::io::Result<()> {
+impl ArtifactState {
+    pub fn new(store: Arc<SampleStore>, token: &str) -> Self {
+        let token = token.trim().to_owned();
+        let token = (!token.is_empty()).then_some(token);
+        Self { store, token }
+    }
+
+    /// Constant-time comparison: response timing must not leak how much of
+    /// the token matched.
+    fn token_matches(&self, presented: Option<&String>) -> bool {
+        match (&self.token, presented) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(expected), Some(actual)) => {
+                let (a, b) = (expected.as_bytes(), actual.as_bytes());
+                if a.len() != b.len() {
+                    return false;
+                }
+                a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+            }
+        }
+    }
+}
+
+pub fn router(state: ArtifactState) -> Router {
+    Router::new().route("/samples/{sha}", get(get_sample).head(head_sample)).with_state(state)
+}
+
+/// Runs until the process is stopped; call from a spawned task. Returns the
+/// bind result so the caller can fail fast instead of publishing requests
+/// into a void.
+pub async fn serve(store: Arc<SampleStore>, bind: &str, token: &str) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(bind = %bind, "artifact server listening");
-    axum::serve(listener, router(store)).await
+    tracing::info!(bind = %bind, protected = !token.trim().is_empty(), "artifact server listening");
+    axum::serve(listener, router(ArtifactState::new(store, token))).await
 }
 
 struct SampleFile {
@@ -96,11 +135,16 @@ async fn body_response(
 }
 
 async fn get_sample(
-    State(store): State<Arc<SampleStore>>,
+    State(state): State<ArtifactState>,
     Path(sha): Path<String>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let sample = match open_sample(&store, &sha).await {
+    if !state.token_matches(params.get("token")) {
+        // 404, not 401: do not confirm that the sample exists.
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let sample = match open_sample(&state.store, &sha).await {
         Ok(sample) => sample,
         Err(status) => return status.into_response(),
     };
@@ -117,8 +161,15 @@ async fn get_sample(
     }
 }
 
-async fn head_sample(State(store): State<Arc<SampleStore>>, Path(sha): Path<String>) -> Response {
-    match open_sample(&store, &sha).await {
+async fn head_sample(
+    State(state): State<ArtifactState>,
+    Path(sha): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !state.token_matches(params.get("token")) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match open_sample(&state.store, &sha).await {
         Ok(sample) => Response::builder()
             .status(StatusCode::OK)
             .header(header::ACCEPT_RANGES, "bytes")
@@ -147,7 +198,9 @@ mod tests {
         let bind = "127.0.0.1:0";
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router(store)).await });
+        tokio::spawn(
+            async move { axum::serve(listener, router(ArtifactState::new(store, ""))).await },
+        );
         let base = format!("http://{address}");
 
         // Full GET via the worker-side fetcher (hash-verified round trip).
@@ -158,7 +211,7 @@ mod tests {
             sha256: versa_scan_core::models::Sha256Digest::from_hex(&stored.sha256).unwrap(),
             size: stored.size,
             priority: versa_scan_core::models::Priority::Normal,
-            report_dest: versa_scan_core::models::ReportDest::new("r"),
+            report_dest: versa_scan_core::models::ReportDest::new("r").unwrap(),
             correlation_id: versa_scan_core::models::CorrelationId::new("c").unwrap(),
             extensions: vec![],
             created_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -226,6 +279,7 @@ mod tests {
                 versa_scan_infra::outbound_adapters::fetch::HttpFetcher::new(
                     Duration::from_secs(10),
                     1024 * 1024,
+                    Vec::new(),
                 )
                 .unwrap(),
             )
@@ -246,4 +300,47 @@ mod tests {
     // Keep the FetchError import referenced (used in the wrapper signature).
     #[allow(dead_code)]
     fn _fetch_error_used(_: FetchError) {}
+}
+
+#[cfg(test)]
+mod token_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn token_protects_the_store() {
+        let tmp = std::env::temp_dir().join(format!("vs-art-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(SampleStore::open(&tmp.join("store")).unwrap());
+        let body = b"artifact body under token";
+        store.put(body).unwrap();
+
+        let bind = "127.0.0.1:0";
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(ArtifactState::new(store, "hunter2"))).await
+        });
+        let base = format!("http://{address}");
+
+        // No token -> 404 (not 401: never confirm existence).
+        let miss = reqwest::get(format!("{base}/samples/{}", sha_hex(body))).await.unwrap();
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+        // Wrong token -> 404.
+        let wrong =
+            reqwest::get(format!("{base}/samples/{}?token=nope", sha_hex(body))).await.unwrap();
+        assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+        // Right token -> 200 with the exact body.
+        let hit =
+            reqwest::get(format!("{base}/samples/{}?token=hunter2", sha_hex(body))).await.unwrap();
+        assert_eq!(hit.status(), StatusCode::OK);
+        assert_eq!(hit.bytes().await.unwrap(), body.as_slice());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        Sha256Digest::to_hex(&sha2::Sha256::digest(bytes))
+    }
 }

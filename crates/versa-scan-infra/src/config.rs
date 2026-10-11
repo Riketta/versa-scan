@@ -27,7 +27,8 @@ pub struct WorkerConfig {
     /// `sandbox` (scan pipeline) or `openbox` (update loop). Hostname-based
     /// detection in the composition root overrides nothing: explicit wins.
     pub role: Option<String>,
-    /// Scanner slug (`clamd`, `defender`, `debug`). Required for sandbox.
+    /// Scanner slug (`clamd`, `yara-x`, `hash-blocklist`, `defender`,
+    /// `debug`). Required for sandbox.
     pub scanner: Option<String>,
     pub workspace_root: PathBuf,
     pub files_per_batch: usize,
@@ -39,6 +40,18 @@ pub struct WorkerConfig {
     pub fetch_timeout_secs: u64,
     pub max_file_size: u64,
     pub scanner_unavailable_backoff_secs: u64,
+    /// Attempt cap for scanner-unavailable batches before they get error
+    /// reports. Higher than the fetch/publish cap (3): an AV daemon restart
+    /// is tolerated longer, but nothing loops forever.
+    pub scanner_max_attempts: u32,
+    /// How long the worker waits for the pipeline's final flush after the
+    /// shutdown signal, seconds. The final flush requeues instead of
+    /// scanning new batches, so this stays small.
+    pub shutdown_grace_secs: u64,
+    /// Fetch-host allowlist (`host` or `host:port` suffixes). Empty = allow
+    /// any URL the bus carries; set it to the artifact server's address to
+    /// stop workers from being pointed at arbitrary hosts.
+    pub fetch_allowed_hosts: Vec<String>,
 }
 
 impl Default for WorkerConfig {
@@ -54,6 +67,9 @@ impl Default for WorkerConfig {
             fetch_timeout_secs: 300,
             max_file_size: 500 * 1024 * 1024,
             scanner_unavailable_backoff_secs: 10,
+            scanner_max_attempts: 10,
+            shutdown_grace_secs: 10,
+            fetch_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -128,7 +144,10 @@ pub struct NatsConfig {
 
 impl Default for NatsConfig {
     fn default() -> Self {
-        Self { url: "nats://localhost:4222".to_owned(), ack_wait_secs: 300, max_deliver: 3 }
+        // ack_wait must cover a whole fetch+scan cycle (the redelivery that
+        // a too-short wait causes hits the duplicate guard and delays the
+        // sample). Default = comfortably above the default scan timeout.
+        Self { url: "nats://localhost:4222".to_owned(), ack_wait_secs: 30 * 60, max_deliver: 3 }
     }
 }
 
@@ -181,6 +200,21 @@ impl Default for LoggingConfig {
     }
 }
 
+/// `[artifact]` - the sample store's HTTP exposure. `token` protects it:
+/// when set, vscli appends the token to every sample URL it publishes and
+/// the embedded artifact server rejects requests without it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArtifactConfig {
+    pub token: String,
+}
+
+impl Default for ArtifactConfig {
+    fn default() -> Self {
+        Self { token: String::new() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Configuration {
@@ -194,6 +228,8 @@ pub struct Configuration {
     pub yara_x: Option<YaraXConfig>,
     /// Feed list; required when `worker.scanner = "hash-blocklist"`.
     pub hash_blocklist: Option<HashBlocklistConfig>,
+    /// Sample-store HTTP exposure (token auth for the artifact server).
+    pub artifact: Option<ArtifactConfig>,
 }
 
 impl Default for Configuration {
@@ -206,6 +242,7 @@ impl Default for Configuration {
             clamd: None,
             yara_x: None,
             hash_blocklist: None,
+            artifact: None,
         }
     }
 }
@@ -287,6 +324,7 @@ impl Configuration {
             scan_timeout: Duration::from_secs(worker.scan_timeout_secs),
             fetch_concurrency: worker.fetch_concurrency.max(1),
             scanner_backoff: Duration::from_secs(worker.scanner_unavailable_backoff_secs),
+            scanner_max_attempts: worker.scanner_max_attempts.clamp(1, u8::MAX as u32) as u8,
         }
     }
 
@@ -311,8 +349,46 @@ impl Configuration {
     }
 
     /// sha256 feed paths from `[hash_blocklist]`.
-    pub fn hash_blocklist_feeds(&self) -> Vec<PathBuf> {
+    pub fn hash_blocklist_feeds(&self) -> Vec<std::path::PathBuf> {
         self.hash_blocklist.clone().unwrap_or_default().feeds
+    }
+
+    /// Artifact-server bearer token (empty = auth disabled).
+    pub fn artifact_token(&self) -> String {
+        self.artifact.clone().unwrap_or_default().token
+    }
+
+    /// Fetch-host allowlist (empty = allow all).
+    pub fn fetch_allowed_hosts(&self) -> Vec<String> {
+        self.worker.fetch_allowed_hosts.clone()
+    }
+
+    /// Shutdown grace for the pipeline's final flush, seconds.
+    pub fn shutdown_grace_secs(&self) -> u64 {
+        self.worker.shutdown_grace_secs.max(1)
+    }
+
+    /// Cross-field consistency checks the composition root runs at boot:
+    /// a NATS `ack_wait` shorter than one fetch+scan cycle makes the broker
+    /// redeliver live batches, and the redelivered twins pile onto the
+    /// duplicate guard. Refuse to boot on that mismatch.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.bus.backend == BusBackend::Nats {
+            let Some(nats) = &self.bus.nats else {
+                return Err(ConfigError::Load(
+                    "bus.backend = nats requires a [bus.nats] section".to_owned(),
+                ));
+            };
+            let budget = self.worker.scan_timeout_secs + self.worker.fetch_timeout_secs;
+            if nats.ack_wait_secs <= budget {
+                return Err(ConfigError::Load(format!(
+                    "bus.nats.ack_wait_secs ({}) must exceed worker.scan_timeout_secs + \
+                     worker.fetch_timeout_secs ({budget}) or live batches get redelivered mid-scan",
+                    nats.ack_wait_secs
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -451,5 +527,64 @@ concurrent_scans = 8
         assert_eq!(settings.files_per_batch, 1);
         assert_eq!(settings.batch_idle_timeout, Duration::from_millis(250));
         assert_eq!(settings.scan_timeout, Duration::from_secs(900));
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+    #[test]
+    fn new_worker_fields_default_and_parse() {
+        let config = Configuration::default();
+        assert_eq!(config.worker.scanner_max_attempts, 10);
+        assert_eq!(config.worker.shutdown_grace_secs, 10);
+        assert!(config.fetch_allowed_hosts().is_empty());
+        assert_eq!(config.artifact_token(), "");
+
+        let toml = r#"
+[worker]
+scanner_max_attempts = 5
+shutdown_grace_secs = 2
+fetch_allowed_hosts = ["art.local:8080", "art.local"]
+
+[artifact]
+token = "s3cret"
+"#;
+        let config: Configuration = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(config.worker.scanner_max_attempts, 5);
+        assert_eq!(config.shutdown_grace_secs(), 2);
+        assert_eq!(config.fetch_allowed_hosts(), vec!["art.local:8080", "art.local"]);
+        assert_eq!(config.artifact_token(), "s3cret");
+    }
+
+    #[test]
+    fn nats_ack_wait_must_cover_a_scan_cycle() {
+        let mut config = Configuration::default();
+        config.bus.backend = BusBackend::Nats;
+        config.bus.nats = Some(NatsConfig {
+            url: "nats://localhost:4222".to_owned(),
+            ack_wait_secs: 1800,
+            max_deliver: 3,
+        });
+        assert!(config.validate().is_ok(), "default ack_wait covers the default scan budget");
+
+        config.bus.nats.as_mut().unwrap().ack_wait_secs = 30;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ack_wait_secs"), "explains the coupling: {err}");
+    }
+
+    #[test]
+    fn validation_is_nats_only() {
+        // RabbitMQ has no ack_wait; the check must not fire.
+        let config = Configuration::default();
+        assert!(config.validate().is_ok());
     }
 }

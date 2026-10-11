@@ -22,6 +22,10 @@ use versa_scan_core::ports::driving::scan_pipeline::ScanPipelinePort;
 use super::ListenerError;
 use crate::config::{BusBackend, BusConfig};
 
+/// First reconnect delay; doubles up to [`MAX_BACKOFF`]. Reset after a
+/// healthy session so one long broker outage does not tax later blips.
+pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
 /// One active listener per worker, wired at the composition root alongside
 /// the pipeline.
 #[async_trait]
@@ -45,7 +49,13 @@ pub async fn connect(config: &BusConfig) -> Result<Arc<dyn BusListener>, Listene
             let cfg = config.rabbitmq.clone().ok_or_else(|| {
                 ListenerError::Configuration("[bus.rabbitmq] section missing".to_owned())
             })?;
-            Ok(Arc::new(rabbitmq::RabbitMqListener::connect(&cfg.url, cfg.prefetch as u16).await?))
+            let prefetch = u16::try_from(cfg.prefetch).map_err(|_| {
+                ListenerError::Configuration(format!(
+                    "bus.rabbitmq.prefetch {} does not fit in u16",
+                    cfg.prefetch
+                ))
+            })?;
+            Ok(Arc::new(rabbitmq::RabbitMqListener::new(&cfg.url, prefetch)))
         }
         BusBackend::Nats => {
             let cfg = config.nats.clone().ok_or_else(|| {

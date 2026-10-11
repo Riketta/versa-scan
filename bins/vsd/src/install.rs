@@ -6,14 +6,38 @@
 
 use anyhow::{Context as _, Result};
 
-const TASK_NAME: &str = "versa-scan";
+/// Task/service name. Shared with the openbox role's restart trigger
+/// (`schtasks /Run` after an auto-applied update).
+pub const TASK_NAME: &str = "versa-scan";
 
-/// Registers the autostart entry for the current executable.
-pub async fn install() -> Result<()> {
+/// Registers the autostart entry for the current executable, pointing it at
+/// the config file it was started with (autostart entries run from a
+/// different working directory - without an absolute `--config` the worker
+/// would boot on defaults alone).
+pub async fn install(config_path: Option<&std::path::Path>) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
+    let config_flag = match config_path {
+        Some(path) => {
+            let abs = path
+                .canonicalize()
+                .with_context(|| format!("resolve config path {}", path.display()))?;
+            Some(abs)
+        }
+        // No --config given: stamp the default file only when it exists.
+        None => match std::env::current_dir()?.join("versa-scan.toml") {
+            candidate if candidate.is_file() => {
+                Some(candidate.canonicalize().context("resolve default versa-scan.toml")?)
+            }
+            _ => None,
+        },
+    };
+    let config_args = config_flag
+        .as_ref()
+        .map(|path| format!("--config \"{}\"", path.display()))
+        .unwrap_or_default();
     #[cfg(windows)]
     {
-        let action = format!("\"{}\"", exe.display());
+        let action = format!("\"{}\" {config_args}", exe.display());
         let output = tokio::process::Command::new("schtasks")
             .args([
                 "/Create", "/F", "/RU", "SYSTEM", "/RL", "HIGHEST", "/SC", "ONSTART", "/TN",
@@ -42,7 +66,7 @@ pub async fn install() -> Result<()> {
              After=network-online.target\n\
              \n\
              [Service]\n\
-             ExecStart={}\n\
+             ExecStart={} {config_args}\n\
              Restart=on-failure\n\
              \n\
              [Install]\n\

@@ -23,6 +23,10 @@ pub enum FetchError {
     TooLarge { limit: u64, actual: u64 },
     #[error("fetch timed out")]
     Timeout,
+    /// The URL's host is not on the worker's fetch allowlist (when one is
+    /// configured). Deterministic: retrying hits the same policy.
+    #[error("fetch host not allowed by fetch_allowed_hosts")]
+    Forbidden,
     /// Transient io/transport failure (connection reset, dns, disk full, ...).
     #[error("fetch io error: {0}")]
     Io(String),
@@ -35,6 +39,7 @@ impl FetchError {
         matches!(
             self,
             FetchError::NotFound
+                | FetchError::Forbidden
                 | FetchError::HashMismatch { .. }
                 | FetchError::SizeMismatch { .. }
                 | FetchError::TooLarge { .. }

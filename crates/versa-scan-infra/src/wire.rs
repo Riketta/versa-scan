@@ -50,7 +50,7 @@ pub fn nats_report_subject(session: &str, sample_id: &SampleId) -> String {
 
 /// NATS wildcard subscription covering a session's report subjects.
 pub fn nats_report_session_wildcard(session: &str) -> String {
-    format!("{REPORTS_SUBJECT_ROOT}{session}.*")
+    format!("{REPORTS_SUBJECT_ROOT}{session}.>")
 }
 
 /// RabbitMQ report queue for one submitting session (shared by all its
@@ -128,7 +128,8 @@ impl SampleRequestV1 {
             sha256,
             size: self.size,
             priority,
-            report_dest: ReportDest::new(&self.report_dest),
+            report_dest: ReportDest::new(&self.report_dest)
+                .map_err(|e| WireError { field: "report_dest", reason: e.to_string() })?,
             correlation_id,
             extensions: self.extensions.clone(),
             created_at: self.created_at,
@@ -467,7 +468,7 @@ mod tests {
             .unwrap(),
             size: 1337,
             priority: Priority::High,
-            report_dest: ReportDest::new("vs.scan.reports.session.s-1"),
+            report_dest: ReportDest::new("vs.scan.reports.session.s-1").unwrap(),
             correlation_id: CorrelationId::new("corr-1").unwrap(),
             extensions: vec!["exe".to_owned()],
             created_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -521,7 +522,7 @@ mod tests {
             sample_id: SampleId::new("s-1").unwrap(),
             correlation_id: CorrelationId::new("corr-1").unwrap(),
             scanner: ScannerId::new("clamd").unwrap(),
-            report_dest: ReportDest::new("vs.scan.reports.session.s-1"),
+            report_dest: ReportDest::new("vs.scan.reports.session.s-1").unwrap(),
             worker: WorkerInfo {
                 hostname: "clamd.sandbox".to_owned(),
                 os: "Linux 6.1".to_owned(),
@@ -548,7 +549,7 @@ mod tests {
     }
 
     fn dest() -> ReportDest {
-        ReportDest::new("vs.scan.reports.session.s-1")
+        ReportDest::new("vs.scan.reports.session.s-1").unwrap()
     }
 
     #[test]
@@ -601,5 +602,23 @@ mod tests {
     fn topology_names() {
         let scanner = ScannerId::new("clamd").unwrap();
         assert_eq!(request_queue_name(&scanner), "vs.scan.requests.clamd");
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+    #[test]
+    fn session_report_wildcard_matches_multi_token_sample_ids() {
+        // Sample ids may contain dots (they are file names); the tail wildcard
+        // must be `>` (one-or-more tokens), not `*` (exactly one), or reports
+        // for ids like `eicar2.bin` would be invisible to the session waiter.
+        let wildcard = nats_report_session_wildcard("sess-1");
+        assert!(wildcard.ends_with(".>"), "{wildcard}");
+        assert!(!wildcard.ends_with(".*"));
+        assert_eq!(wildcard, format!("{REPORTS_SUBJECT_ROOT}sess-1.>"));
     }
 }

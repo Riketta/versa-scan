@@ -68,8 +68,9 @@ dependency changes ship with an updated lockfile.
 - Facade exceptions in core (same category as versa-bot's
   tracing-is-the-port rule): `tokio` (time/sync/rt), `tokio-util`
   (CancellationToken), `tracing`, `serde`/`serde_json` (workspace
-  manifests), `time`, `thiserror`, `uuid`, `futures-util`, `async-trait`.
-  Adding anything else to core needs a deliberate decision.
+  manifests), `time`, `thiserror`, `uuid`, `futures-util`, `async-trait`,
+  `parking_lot` (orchestrator state mutexes). Adding anything else to core
+  needs a deliberate decision.
 
 ### Port cardinality
 
@@ -77,10 +78,12 @@ dependency changes ship with an updated lockfile.
   inbound bus listeners ingest deliveries and signal stream ends, never
   settling deliveries themselves (settlement is a core decision).
 - Driven ports (`ScannerPort`, `RequestPublisherPort`,
-  `ReportPublisherPort`, `SampleFetcherPort`, `SchedulerPort`,
-  `SelfUpdatePort`): one active adapter per process, chosen and wired at
-  the composition root, injected into core services. The bus publisher
-  pair may be one adapter object implementing both publisher ports.
+  `ReportPublisherPort`, `SampleFetcherPort`, `SelfUpdatePort`): one
+  active adapter per process, chosen and wired at the composition root,
+  injected into core services. The bus publisher pair may be one adapter
+  object implementing both publisher ports. (A `SchedulerPort` existed and
+  was removed: the openbox update loop needs one `tokio::time::sleep`
+  interval, not a scheduling abstraction.)
 - There is deliberately NO plugin system and no plugin-to-plugin bus.
 
 ### ACL / models
@@ -126,7 +129,7 @@ reload by design (worker connections are deployment-static).
 - Scanner adapters are tested against recorded log/protocol fixtures.
 - Bus adapters get integration tests against real brokers via
   `docker-compose.yaml` (rabbitmq, nats, clamd): env-gated by
-  `VERSA_SCAN_TEST_RABBITMQ` / `VERSA_SCAN_TEST_NATS` - set on Linux CI,
+  `VS_SCAN_TEST_RABBITMQ` / `VS_SCAN_TEST_NATS` - set on Linux CI,
   skipped elsewhere.
 - E2E: `vscli submit --wait` <-> `vsd` with the `debug` scanner over both
   real buses.

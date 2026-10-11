@@ -68,8 +68,8 @@ Broker integration tests are skipped unless the brokers are reachable:
 
 ```
 docker compose up -d rabbitmq nats clamd
-VERSA_SCAN_TEST_RABBITMQ=amqp://versa:versa@localhost:5672/%2f \
-VERSA_SCAN_TEST_NATS=nats://localhost:4222 \
+VS_SCAN_TEST_RABBITMQ=amqp://versa:versa@localhost:5672/%2f \
+VS_SCAN_TEST_NATS=nats://localhost:4222 \
 cargo test
 ```
 
@@ -143,6 +143,28 @@ vscli reports <sample-id>
 
 Open/free scanner focus: commercial AVs from the C# system (KES, DrWeb,
 NOD32, ...) are out of scope - new sources arrive as `ScannerPort`
+## Security model
+
+The bus is treated as untrusted input. Hardening in place:
+
+- **Sample ids are file names** and are validated at the wire boundary to
+  `[A-Za-z0-9._-]` (no path separators, no dot-only values) - a hostile
+  publisher cannot escape the batch workspace. `report_dest` is validated
+  the same way.
+- **Artifact server auth**: set `[artifact] token = "..."` in the vscli
+  config; every sample URL the CLI publishes gets `?token=...` appended and
+  the server rejects requests without it (404, constant-time compare).
+  Empty token = open server (fine on loopback; a loud warning is logged
+  when binding non-loopback without one).
+- **Fetch allowlist**: `[worker] fetch_allowed_hosts = ["art.local:8080"]`
+  restricts what URLs workers will GET. Empty = allow all (default).
+- **Bounded retries everywhere**: fetch/publish failures cap at 3 attempts;
+  scanner-unavailable caps at `worker.scanner_max_attempts` (default 10);
+  after the cap, samples get error reports - nothing loops forever and
+  nothing vanishes without a report.
+- **Defender fails closed**: exit 2 with unparseable findings is a scan
+  error, never a clean verdict.
+
 adapters (see `docs/DESIGN.md` for the adapter template). Useful next
 feeds: abuse.ch MalwareBazaar sha256 exports. The `yara-x` example rule
 set lives in `examples/rules/`.

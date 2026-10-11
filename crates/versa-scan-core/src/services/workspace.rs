@@ -46,17 +46,24 @@ impl WorkspaceManager {
     }
 
     /// Removes leftover batch directories from previous runs (e.g. crashes).
-    /// Called once at startup.
+    /// Called once at startup. Only directories carrying a `manifest.json`
+    /// are removed - a misconfigured workspace_root must not wipe unrelated
+    /// operator data.
     pub fn sweep(&self) -> Result<usize, WorkspaceError> {
         let mut removed = 0;
         let mut entries = std::fs::read_dir(&self.root)?;
         while let Some(entry) = entries.next() {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            if path.is_dir() && path.join("manifest.json").is_file() {
                 tracing::info!(dir = %path.display(), "sweeping leftover batch workspace");
                 std::fs::remove_dir_all(&path)?;
                 removed += 1;
+            } else if path.is_dir() {
+                tracing::warn!(
+                    dir = %path.display(),
+                    "directory under workspace_root has no manifest.json; leaving it alone"
+                );
             }
         }
         Ok(removed)
@@ -158,7 +165,7 @@ mod tests {
             .unwrap(),
             size: 1,
             priority: Priority::High,
-            report_dest: ReportDest::new("reports"),
+            report_dest: ReportDest::new("reports").unwrap(),
             correlation_id: CorrelationId::new("corr").unwrap(),
             extensions: vec![],
             created_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -189,13 +196,24 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_leftovers() {
+    fn sweep_removes_leftovers_only() {
         let tmp = std::env::temp_dir().join(format!("vs-ws-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
         let manager = WorkspaceManager::new(&tmp).unwrap();
-        std::fs::create_dir_all(tmp.join("stale-batch").join("files")).unwrap();
+
+        // A crashed batch (manifest present) is swept...
+        let stale = tmp.join("stale-batch");
+        std::fs::create_dir_all(stale.join("files")).unwrap();
+        std::fs::write(stale.join("manifest.json"), "{}").unwrap();
+        // ...an operator directory without one is left alone.
+        let foreign = tmp.join("not-a-batch");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("precious.txt"), "keep me").unwrap();
+
         let removed = manager.sweep().unwrap();
         assert_eq!(removed, 1);
-        assert!(!tmp.join("stale-batch").exists());
+        assert!(!stale.exists());
+        assert!(foreign.exists(), "foreign directories are never swept");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

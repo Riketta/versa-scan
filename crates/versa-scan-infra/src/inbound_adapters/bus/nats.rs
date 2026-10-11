@@ -186,4 +186,12 @@ impl DeliveryHandle for NatsHandle {
         let result = self.message.ack_with(AckKind::Term).await;
         Self::log(result, "term");
     }
+
+    async fn nak_delay(&self, delay: Duration) {
+        // Delayed redelivery: the twin's original is still being processed,
+        // so the twin waits instead of hammering the pipeline (or being
+        // terminated - that would lose the sample if the original died).
+        let result = self.message.ack_with(AckKind::Nak(Some(delay))).await;
+        Self::log(result, "nak-delay");
+    }
 }

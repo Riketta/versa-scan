@@ -59,9 +59,17 @@ impl ClamdScanner {
 
     async fn command(&self, command: &[u8]) -> Result<String, ScannerError> {
         let mut stream = self.connect().await?;
-        run_command(&mut stream, command)
-            .await
-            .map_err(|e| ScannerError::Unavailable(format!("clamd {}: {e}", self.address)))
+        // A clamd that accepts TCP but never answers must not wedge the
+        // pipeline (this runs inside profile()/is_installed(), which have
+        // their own outer caps - but the socket read is the real deadline).
+        match tokio::time::timeout(IO_TIMEOUT, run_command(&mut stream, command)).await {
+            Ok(result) => result
+                .map_err(|e| ScannerError::Unavailable(format!("clamd {}: {e}", self.address))),
+            Err(_) => Err(ScannerError::Unavailable(format!(
+                "clamd {} response timed out after {IO_TIMEOUT:?}",
+                self.address
+            ))),
+        }
     }
 
     /// Streams one file from disk through INSTREAM without buffering it
@@ -149,19 +157,6 @@ fn parse_version(response: &str) -> AvProfile {
     profile
 }
 
-async fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    let mut entries = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.is_dir() {
-            Box::pin(walk_files(&path, out)).await?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl ScannerPort for ClamdScanner {
     fn id(&self) -> ScannerId {
@@ -188,9 +183,7 @@ impl ScannerPort for ClamdScanner {
 
     async fn scan(&self, dir: &Path) -> Result<ScanOutput, ScannerError> {
         let mut files: Vec<PathBuf> = Vec::new();
-        walk_files(dir, &mut files)
-            .await
-            .map_err(|e| ScannerError::Io(format!("clamd walk: {e}")))?;
+        super::collect_files_recursive(dir, &mut files);
         files.sort();
 
         // Parallel INSTREAM: every future owns its file name, so results

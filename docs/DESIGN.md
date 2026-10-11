@@ -23,7 +23,8 @@ docs and code disagree, fix the doc.
 | D8 | NATS mode | JetStream: workqueue stream for requests, limits-retention stream for reports, durable pull consumers, explicit ack, `Nats-Msg-Id` dedupe. |
 | D9 | Platforms | Windows-first (AV world) with first-class Linux support (clamd/debug CI, deployments). Cross-platform from day one. |
 | D10 | Gates | versa-bot style: pinned toolchain, 2024 edition, `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked` → `cargo test --locked`; `[lints.clippy]` deny `unwrap_used`, `indexing_slicing`. |
-| D11 | Scanners v2 (open/free focus) | Commercial AVs dropped. New adapters: `yara-x` (embedded YARA-X lib; rules dir/file, stat-fingerprint hot-reload, engine-side `set_timeout` bounds pathological rules), `hash-blocklist` (local sha256 feeds, comment/label format, stat-skip reload, forced reload in `update()`). `clamd` stays TCP-only (INSTREAM avoids clamd file-permission issues, works remotely); improvements: streamed file chunks (no full buffering), `[clamd] concurrent_scans` parallel INSTREAM, per-future name attribution, size-limit ERROR → actionable per-file message. Bad yara rules are `ScanFailed` (terminal, error reports), never `NotInstalled` (which would requeue forever). |
+| D11 | Scanners v2 (open/free focus) | New adapters: `yara-x` (embedded YARA-X lib; rules dir/file, stat-fingerprint hot-reload, engine-side `set_timeout` bounds pathological rules), `hash-blocklist` (local sha256 feeds, comment/label format, stat-skip reload, forced reload in `update()`). `clamd` stays TCP-only (INSTREAM avoids clamd file-permission issues, works remotely); improvements: streamed file chunks (no full buffering), `[clamd] concurrent_scans` parallel INSTREAM, per-future name attribution, size-limit ERROR → actionable per-file message. Bad yara rules are `ScanFailed` (terminal, error reports), never `NotInstalled` (which would requeue forever). |
+| D12 | Review hardening | Untrusted-bus boundaries tightened after the 4-reviewer audit: `SampleId` charset `[A-Za-z0-9._-]` (no separators/dot-only values — kills path traversal + NATS subject-token breaks), `ReportDest` validated, sample URLs are `<advertise>/samples/<sha256>` (+ `?token=` when `[artifact].token` is set), `[worker].fetch_allowed_hosts` SSRF allowlist (empty = allow all). RMQ requeues are **republish-with-`x-vs-attempt`-header + confirm-then-ack** (the redelivered flag cannot count — the old attempt=1/2 cap made the retry bound unenforceable); scanner-unavailable paths now go through the retry policy with their own `scanner_max_attempts` cap (default 10) and terminal error reports; NATS twins `nak(delay)` instead of terminate; NATS `ack_wait` must exceed `scan_timeout + fetch_timeout` (validated at boot). POSIX self-update renames over the running exe (ETXTBSY); auto-apply exits with code 7 (systemd `Restart=on-failure`) and triggers the Windows scheduled task. Defender fails closed on exit-2-with-no-parsed-findings. `SchedulerPort` removed (one sleep needs no abstraction).  (open/free scanner focus, see the following row) |
 
 ## System shape
 
@@ -176,7 +177,7 @@ pub trait SelfUpdatePort { async fn check(...) -> Option<Update>; async fn apply
     failure → requeue batch + cooldown instead).
 - **`Validation`** — scanned-file count vs batch size, per-file coverage; missing
   verdict → synthesized error verdict (kept from C#).
-- **`WorkspaceManager`** — batch dirs under `workspace_root/<ts>-<batch_id>/`;
+- **`WorkspaceManager`** — batch dirs under `workspace_root/<batch_id>/`;
   guaranteed cleanup (RAII guard + explicit), manifest.json written on close
   (replaces the C# finalizer `taskinfo.txt` hack — fixes disk-fill bug).
 - **`Orchestrator`** — wires it all: consume → plan → fetch (bounded parallel)
@@ -245,19 +246,24 @@ JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps. DTOs live in
 
 - Stream `VS_SCAN_REQUESTS`, subject `vs.scan.requests.<scanner>`,
   `WorkQueuePolicy`, `AckExplicit`, duplicates window 2 min,
-  `Nats-Msg-Id = <sample_id>` (publish dedupe).
+  `Nats-Msg-Id = <sample_id>.<scanner>` (publish dedupe; the scanner suffix is
+  what lets `--scanner all` fan one sample out to every scanner - the bare id
+  collapsed the fan-out).
 - Durable pull consumer `vs-<scanner>` (filter `vs.scan.requests.<scanner>`),
   `MaxDeliver = 3`, `AckWait` from config. **Priority is a no-op on NATS**
   (kept simple per review): requests publish to the scanner's single subject
   regardless of priority; the RMQ adapter honors `x-max-priority`.
-- Reports: stream `VS_SCAN_REPORTS`, subjects `vs.scan.reports.<scanner>.<sample_id>`,
+- Reports: stream `VS_SCAN_REPORTS`, subjects `vs.scan.reports.<session>.<sample_id>`,
   `LimitsPolicy` + `max_age = 7d`, `Nats-Msg-Id = <sample_id>.<scanner>.<attempt>`
   (worker-side republish dedupe). `vscli --wait` consumes via an ephemeral pull
   consumer on its session wildcard (`DeliverPolicy::New`, inactive-threshold
-  cleanup) - JetStream publishes never reach plain core-NATS subscribers, so
-  the listener MUST consume from the stream. One uniform JetStream path for
-  both CLI and future collectors.
-  for both CLI and future collectors). Settlement: ack / nak / term.
+      cleanup) - the `>` tail of the session wildcard matches multi-token
+      sample ids (ids are file names, dots allowed). JetStream publishes
+      are ordinary core-NATS messages on the original subject - the claim
+      that plain subscribers cannot see them was wrong; the session
+      waiter consumes from the stream anyway (one uniform path for both
+      CLI and future collectors).
+  both CLI and future collectors).
 
 ## vsd (worker daemon)
 
@@ -276,7 +282,8 @@ JSON everywhere, `schema: 1` field. RFC 3339 UTC timestamps. DTOs live in
 
 - **Own storage** (D4): content-addressed store, default
   `%LOCALAPPDATA%/vscli` / `~/.local/share/vscli` (overridable):
-  `samples/<sha256[0:2]>/<sha256>` + sqlite index (submissions, reports).
+  `samples/<sha256[0:2]>/<sha256>` + `reports.jsonl` log (the sqlite
+  index was planned and dropped - one append-only log is enough).
 - **Embedded server** (`axum`): `GET/HEAD /samples/<sha256>` (+ range requests),
   bind `--bind 0.0.0.0:8080`, advertised base `--advertise http://host:port`
   (NAT scenarios). Stays up for the duration of `submit --wait`, or runs

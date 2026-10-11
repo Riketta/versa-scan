@@ -10,12 +10,32 @@ use super::priority::Priority;
 /// a RabbitMQ adapter reads it as a queue name, a NATS adapter as a subject.
 /// The requester owns the destination and must have it ready (declared /
 /// subscribed) before publishing requests.
+///
+/// Validated as broker-safe tokens (`[A-Za-z0-9._>*-]`): the value comes
+/// off the untrusted bus and is used verbatim as a routing key / subject
+/// (`>`/`*` are NATS wildcards - the session waiter subscribes with a
+/// `>` tail), so a hostile payload must not be able to smuggle whitespace
+/// or path separators into it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReportDest(String);
 
 impl ReportDest {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn new(value: impl Into<String>) -> Result<Self, crate::models::ids::InvalidId> {
+        let value = value.into();
+        let invalid = |reason: &str| crate::models::ids::InvalidId::new(reason);
+        if value.is_empty() {
+            return Err(invalid("ReportDest must not be empty"));
+        }
+        if value.len() > 256 {
+            return Err(invalid("ReportDest longer than 256 chars"));
+        }
+        if !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'>' | b'*'))
+        {
+            return Err(invalid("ReportDest must only contain [A-Za-z0-9._>*-]"));
+        }
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -46,4 +66,38 @@ pub struct SampleRequest {
     /// File-extension hints (informational; scanners may use them).
     pub extensions: Vec<String>,
     pub created_at: OffsetDateTime,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn accepts_concrete_subjects_queues_and_nats_wildcards() {
+        for ok in [
+            "vs.scan.reports.session.s-1",
+            "reports",
+            "vs.scan.reports.s.x-y_z",
+            "vs.scan.reports.session.>", // session waiter wildcard
+        ] {
+            assert!(ReportDest::new(ok).is_ok(), "must accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_hostile_and_whitespace() {
+        for bad in [
+            "",
+            "a b",
+            "queue;drop",
+            "../escape",
+            "dest
+line",
+            "dest with spaces",
+        ] {
+            assert!(ReportDest::new(bad).is_err(), "must reject {bad:?}");
+        }
+    }
 }

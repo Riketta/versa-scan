@@ -4,9 +4,11 @@
 //! Loop shape: one immediate pass on start, then a pass every
 //! `check_interval_secs`. A pass runs the scanner's database update, then
 //! (when self-update is enabled) checks the update server; with
-//! `auto_apply`, a pending update is applied and the loop returns, letting
-//! the process exit cleanly so the service manager restarts the new
-//! version. Update failures are logged and retried on the next pass.
+//! `auto_apply`, a pending update is applied and the loop exits with the
+//! designated restart code so the service manager starts the new version
+//! (systemd `Restart=on-failure` catches the non-zero exit; on Windows the
+//! registered scheduled task is triggered explicitly before exiting).
+//! Update failures are logged and retried on the next pass.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,26 +17,28 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use versa_scan_core::models::worker::WorkerInfo;
 use versa_scan_core::ports::driven::scanner::ScannerPort;
-use versa_scan_core::ports::driven::scheduler::SchedulerPort;
 use versa_scan_core::ports::driven::self_update::SelfUpdatePort;
 use versa_scan_infra::config::Configuration;
-use versa_scan_infra::outbound_adapters::scheduler::TokioScheduler;
+
+/// Exit code that means "apply succeeded; start me again". systemd's
+/// `Restart=on-failure` (the generated unit) restarts on any non-zero exit.
+pub const RESTART_EXIT_CODE: u8 = 7;
 
 pub struct OpenboxDeps {
     pub scanner: Arc<dyn ScannerPort>,
     pub updater: Option<Arc<dyn SelfUpdatePort>>,
-    #[allow(dead_code)] // injected for parity with the sandbox role wiring
-    pub scheduler: Arc<dyn SchedulerPort>,
     pub config: Configuration,
     pub worker: WorkerInfo,
 }
 
-/// Runs until cancelled. Exits early (Ok) after an auto-applied update so
-/// the process can be restarted into the new version.
-pub async fn run(deps: OpenboxDeps, cancel: CancellationToken) -> Result<()> {
+/// Runs until cancelled. Returns `Ok(true)` after an auto-applied update:
+/// the process should exit with [`RESTART_EXIT_CODE`] so the service
+/// manager starts the new version.
+pub async fn run(deps: OpenboxDeps, cancel: CancellationToken) -> Result<bool> {
     tracing::info!(scanner = %deps.scanner.id().as_str(), "openbox role: update loop");
     if run_pass(&deps).await {
-        return Ok(());
+        trigger_restart().await;
+        return Ok(true);
     }
 
     let interval = Duration::from_secs(deps.config.self_update.check_interval_secs.max(1));
@@ -43,24 +47,69 @@ pub async fn run(deps: OpenboxDeps, cancel: CancellationToken) -> Result<()> {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(interval) => {
                 if run_pass(&deps).await {
-                    return Ok(());
+                    trigger_restart().await;
+                    return Ok(true);
                 }
             }
         }
     }
     tracing::info!("openbox update loop stopped");
-    Ok(())
+    Ok(false)
+}
+
+/// Best-effort platform nudge so the worker comes back up immediately:
+/// - systemd needs nothing (`Restart=on-failure` restarts the non-zero exit);
+/// - Windows Task Scheduler `ONSTART` tasks do not restart on exit, so the
+///   registered task is triggered explicitly before exiting.
+async fn trigger_restart() {
+    #[cfg(windows)]
+    {
+        let output = tokio::process::Command::new("schtasks")
+            .args(["/Run", "/TN", crate::install::TASK_NAME])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .await;
+        match output {
+            Ok(output) if output.status.success() => {
+                tracing::info!(
+                    task = crate::install::TASK_NAME,
+                    "scheduled task triggered for restart"
+                );
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    status = %output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "could not trigger the scheduled task; restart on boot only"
+                );
+            }
+            Err(err) => tracing::warn!(error = %err, "schtasks spawn failed; restart on boot only"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // systemd handles it via Restart=on-failure + the restart exit code.
+    }
 }
 
 /// One update pass. Returns true when the worker was updated and the
 /// process should exit for a restart.
 pub async fn run_pass(deps: &OpenboxDeps) -> bool {
-    update_scanner_databases(&deps.scanner).await;
+    let budget = Duration::from_secs(deps.config.worker.scan_timeout_secs.max(60));
+    update_scanner_databases(&deps.scanner, budget).await;
     check_worker_update(deps).await
 }
 
-async fn update_scanner_databases(scanner: &Arc<dyn ScannerPort>) {
-    match scanner.update().await {
+async fn update_scanner_databases(scanner: &Arc<dyn ScannerPort>, budget: Duration) {
+    // A hung scanner update (daemon wedged mid-refresh) must not stall the
+    // update loop forever.
+    let result = match tokio::time::timeout(budget, scanner.update()).await {
+        Ok(result) => result,
+        Err(_) => Err(versa_scan_core::ports::driven::scanner::ScannerError::Update(format!(
+            "scanner update timed out after {budget:?}"
+        ))),
+    };
+    match result {
         Ok(outcome) => {
             tracing::info!(
                 scanner = %scanner.id().as_str(),
@@ -108,22 +157,17 @@ async fn check_worker_update(deps: &OpenboxDeps) -> bool {
     }
 }
 
-/// Convenience wrapper used by the composition root: builds the scheduler
-/// and runs until cancelled.
+/// Convenience wrapper used by the composition root: builds deps and runs
+/// until cancelled. Returns `Ok(true)` when the process should exit with
+/// [`RESTART_EXIT_CODE`].
 pub async fn run_with_config(
     config: &Configuration,
     scanner: Arc<dyn ScannerPort>,
     updater: Option<Arc<dyn SelfUpdatePort>>,
     worker: WorkerInfo,
     cancel: CancellationToken,
-) -> Result<()> {
-    let deps = OpenboxDeps {
-        scanner,
-        updater,
-        scheduler: Arc::new(TokioScheduler::new()),
-        config: config.clone(),
-        worker,
-    };
+) -> Result<bool> {
+    let deps = OpenboxDeps { scanner, updater, config: config.clone(), worker };
     run(deps, cancel).await
 }
 
@@ -201,7 +245,6 @@ mod tests {
         OpenboxDeps {
             scanner: Arc::new(scanner),
             updater,
-            scheduler: Arc::new(TokioScheduler::new()),
             config,
             worker: WorkerInfo {
                 hostname: "h".to_owned(),
@@ -272,13 +315,5 @@ mod tests {
         }
         let deps = deps(scanner, Some(Arc::new(FailingUpdater)), true);
         assert!(!run_pass(&deps).await, "check failure is retried next pass");
-    }
-
-    // Digest import used by the fake updater payloads.
-    // Digest helper for fake updater payloads.
-    #[allow(dead_code)]
-    fn _digest_helper() -> Sha256Digest {
-        Sha256Digest::from_hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-            .unwrap()
     }
 }

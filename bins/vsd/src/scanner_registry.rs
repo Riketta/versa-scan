@@ -2,6 +2,7 @@
 //! adapters (the Rust replacement for the C# reflection-based discovery).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use versa_scan_core::ports::driven::scanner::ScannerPort;
@@ -25,7 +26,9 @@ pub fn build(config: &Configuration) -> anyhow::Result<Arc<dyn ScannerPort>> {
         "clamd" => {
             Ok(Arc::new(ClamdScanner::new(config.clamd_address(), config.clamd_concurrent_scans())))
         }
-        "defender" => Ok(Arc::new(DefenderScanner::new())),
+        "defender" => {
+            Ok(Arc::new(DefenderScanner::new(Duration::from_secs(config.worker.scan_timeout_secs))))
+        }
         "debug" => Ok(Arc::new(DebugScanner::new())),
         "hash-blocklist" => Ok(Arc::new(HashBlocklistScanner::new(config.hash_blocklist_feeds()))),
         "yara-x" => {
@@ -50,7 +53,11 @@ pub async fn detect(config: &Configuration) {
                     .is_installed()
                     .await
             }
-            "defender" => DefenderScanner::new().is_installed().await,
+            "defender" => {
+                DefenderScanner::new(Duration::from_secs(config.worker.scan_timeout_secs))
+                    .is_installed()
+                    .await
+            }
             "debug" => DebugScanner::new().is_installed().await,
             "hash-blocklist" => {
                 HashBlocklistScanner::new(config.hash_blocklist_feeds()).is_installed().await

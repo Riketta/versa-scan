@@ -111,7 +111,7 @@ mod tests {
             .unwrap(),
             size: 10,
             priority,
-            report_dest: ReportDest::new("reports"),
+            report_dest: ReportDest::new("reports").unwrap(),
             correlation_id: CorrelationId::new("corr").unwrap(),
             extensions: vec![],
             created_at: time::OffsetDateTime::UNIX_EPOCH,

@@ -6,6 +6,10 @@
 //! - Reports go to the request's `report_dest` queue via the default
 //!   exchange; the requester owns its declaration.
 //! - Both publishes are persistent and confirmed before Ok.
+//! - Reconnect: the channel is checked before each publish and re-established
+//!   when the broker dropped it (the listener owns the same logic).
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, QueueDeclareOptions};
@@ -24,12 +28,30 @@ const EXCHANGE: &str = "";
 
 #[derive(Clone)]
 pub struct RabbitMqPublisher {
-    channel: Channel,
+    url: String,
+    session: Arc<parking_lot::Mutex<Option<Channel>>>,
 }
 
 impl RabbitMqPublisher {
     pub async fn connect(url: &str) -> Result<Self, PublishError> {
-        let connection = Connection::connect(url, ConnectionProperties::default())
+        Ok(Self { url: url.to_owned(), session: Arc::new(parking_lot::Mutex::new(None)) })
+    }
+
+    fn request_queue_args() -> FieldTable {
+        let mut args = FieldTable::default();
+        args.insert(MAX_PRIORITY_ARG.into(), AMQPValue::LongInt(2));
+        args
+    }
+
+    /// Returns a live, confirm-mode channel, reconnecting first when the
+    /// cached one is gone. Dropping the `Connection` handle is safe - lapin
+    /// keeps the transport alive on an internal reactor - so only the
+    /// channel is cached. The lock is never held across `.await`.
+    async fn channel(&self) -> Result<Channel, PublishError> {
+        if let Some(channel) = self.cached_channel() {
+            return Ok(channel);
+        }
+        let connection = Connection::connect(&self.url, ConnectionProperties::default())
             .await
             .map_err(|e| PublishError::Connection(format!("rabbitmq connect: {e}")))?;
         let channel = connection
@@ -40,17 +62,26 @@ impl RabbitMqPublisher {
             .confirm_select(ConfirmSelectOptions::default())
             .await
             .map_err(|e| PublishError::Connection(format!("rabbitmq confirm_select: {e}")))?;
-        Ok(Self { channel })
+        *self.session.lock() = Some(channel.clone());
+        Ok(channel)
     }
 
-    fn request_queue_args() -> FieldTable {
-        let mut args = FieldTable::default();
-        args.insert(MAX_PRIORITY_ARG.into(), AMQPValue::LongInt(2));
-        args
+    fn cached_channel(&self) -> Option<Channel> {
+        let mut cached = self.session.lock();
+        match cached.as_ref() {
+            Some(channel) if channel.status().connected() => Some(channel.clone()),
+            Some(_) => {
+                tracing::warn!("rabbitmq publisher channel lost; reconnecting");
+                *cached = None;
+                None
+            }
+            None => None,
+        }
     }
 
     async fn declare_request_queue(&self, queue: &str) -> Result<(), PublishError> {
-        self.channel
+        let channel = self.channel().await?;
+        channel
             .queue_declare(
                 queue,
                 QueueDeclareOptions { durable: true, ..Default::default() },
@@ -67,8 +98,8 @@ impl RabbitMqPublisher {
         payload: &[u8],
         priority: u8,
     ) -> Result<(), PublishError> {
-        let confirm = self
-            .channel
+        let channel = self.channel().await?;
+        let confirm = channel
             .basic_publish(
                 EXCHANGE,
                 routing_key,

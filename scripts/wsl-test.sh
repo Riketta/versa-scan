@@ -36,8 +36,8 @@ wait_port() {
 wait_port 5672 rabbitmq
 wait_port 4222 nats
 
-export VERSA_SCAN_TEST_RABBITMQ=amqp://versa:versa@localhost:5672/%2f
-export VERSA_SCAN_TEST_NATS=nats://localhost:4222
+export VS_SCAN_TEST_RABBITMQ=amqp://versa:versa@localhost:5672/%2f
+export VS_SCAN_TEST_NATS=nats://localhost:4222
 
 if [ -f "$HOME/.cargo/env" ]; then
     # shellcheck disable=SC1091

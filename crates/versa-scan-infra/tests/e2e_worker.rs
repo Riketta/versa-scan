@@ -91,7 +91,7 @@ fn request(base: &str, id: &str, bytes: &[u8]) -> versa_scan_core::models::sampl
         sha256: Sha256Digest::from_hex(&sha_hex(bytes)).unwrap(),
         size: bytes.len() as u64,
         priority: Priority::Normal,
-        report_dest: ReportDest::new("reports"),
+        report_dest: ReportDest::new("reports").unwrap(),
         correlation_id: CorrelationId::new("corr").unwrap(),
         extensions: vec![],
         created_at: time::OffsetDateTime::now_utc(),
@@ -135,7 +135,7 @@ async fn end_to_end_submit_fetch_scan_report() {
     let scanner: Arc<dyn ScannerPort> = Arc::new(DebugScanner::new());
     // Max file size below the oversized sample -> terminal TooLarge report.
     let fetcher: Arc<dyn SampleFetcherPort> =
-        Arc::new(HttpFetcher::new(Duration::from_secs(10), 64).unwrap());
+        Arc::new(HttpFetcher::new(Duration::from_secs(10), 64, Vec::new()).unwrap());
     let report_publisher: Arc<dyn ReportPublisherPort> = publisher.clone();
 
     let orchestrator = Arc::new(
@@ -150,6 +150,7 @@ async fn end_to_end_submit_fetch_scan_report() {
                 scan_timeout: Duration::from_secs(10),
                 fetch_concurrency: 2,
                 scanner_backoff: Duration::from_millis(10),
+                scanner_max_attempts: 3,
             },
             WorkerInfo {
                 hostname: "e2e-host".to_owned(),
