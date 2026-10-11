@@ -486,6 +486,11 @@ impl Orchestrator {
     ) {
         for file in files {
             if let Some(record) = ledger.remove(&file.request.sample_id) {
+                tracing::debug!(
+                    sample_id = %file.request.sample_id,
+                    attempt = record.attempt,
+                    "requeueing delivery"
+                );
                 record.handle.nak_requeue().await;
             }
         }

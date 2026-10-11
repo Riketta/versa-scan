@@ -48,11 +48,31 @@ impl SampleFetcherPort for HttpFetcher {
         // that passes per-stream verification.
         let tmp = dest.with_extension(format!("part-{}", Uuid::new_v4()));
 
-        let result = self.fetch_inner(request, dest, &tmp).await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&tmp).await;
+        // Log the URL without its query string: `?token=` must not reach
+        // the logs.
+        let url = request.url.split('?').next().unwrap_or(&request.url);
+        let started = std::time::Instant::now();
+        match self.fetch_inner(request, dest, &tmp).await {
+            Ok(file) => {
+                tracing::debug!(
+                    url = %url,
+                    size = file.size,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "sample fetched and verified"
+                );
+                Ok(file)
+            }
+            Err(err) => {
+                if let Err(cleanup) = tokio::fs::remove_file(&tmp).await {
+                    tracing::debug!(
+                        error = %cleanup,
+                        tmp = %tmp.display(),
+                        "temp file cleanup failed"
+                    );
+                }
+                Err(err)
+            }
         }
-        result
     }
 }
 

@@ -35,7 +35,25 @@ pub struct NatsPublisher {
 
 impl NatsPublisher {
     pub async fn connect(url: &str) -> Result<Self, PublishError> {
-        let client = async_nats::connect(url)
+        // Surface reconnects: publish confirms hide broker drops from
+        // callers, so connection state must be visible in the logs.
+        let options = async_nats::ConnectOptions::new().event_callback(|event| async move {
+            match event {
+                async_nats::Event::Disconnected => {
+                    tracing::warn!("nats connection lost; client will reconnect");
+                }
+                async_nats::Event::Connected => {
+                    tracing::info!("nats connected");
+                }
+                async_nats::Event::Closed => {
+                    tracing::error!("nats connection closed permanently");
+                }
+                other => {
+                    tracing::debug!(event = %other, "nats connection event");
+                }
+            }
+        });
+        let client = async_nats::connect_with_options(url, options)
             .await
             .map_err(|e| PublishError::Connection(format!("nats connect: {e}")))?;
         let context = async_nats::jetstream::new(client);

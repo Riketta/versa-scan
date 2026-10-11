@@ -57,7 +57,26 @@ impl ArtifactState {
 }
 
 pub fn router(state: ArtifactState) -> Router {
-    Router::new().route("/samples/{sha}", get(get_sample).head(head_sample)).with_state(state)
+    Router::new()
+        .route("/samples/{sha}", get(get_sample).head(head_sample))
+        .layer(axum::middleware::from_fn(access_log))
+        .with_state(state)
+}
+
+/// One debug line per request: with `--wait`, the artifact server is the
+/// only link between workers and the CLI, so a dead-quiet server makes
+/// "why are reports missing" undiagnosable.
+async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let response = next.run(req).await;
+    tracing::debug!(
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        "artifact request"
+    );
+    response
 }
 
 /// Runs until the process is stopped; call from a spawned task. Returns the
@@ -78,7 +97,7 @@ async fn open_sample(store: &SampleStore, sha: &str) -> Result<SampleFile, Statu
     let digest = Sha256Digest::from_hex(sha).map_err(|_| StatusCode::BAD_REQUEST)?;
     let shard = digest.as_str().get(0..2).ok_or(StatusCode::BAD_REQUEST)?;
     let path = store.samples_dir().join(shard).join(digest.as_str());
-    let mut file = tokio::fs::File::open(&path).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let file = tokio::fs::File::open(&path).await.map_err(|_| StatusCode::NOT_FOUND)?;
     let size = file.metadata().await.map_err(|_| StatusCode::NOT_FOUND)?.len();
     Ok(SampleFile { file, size })
 }

@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 use versa_scan_core::models::worker::WorkerRole;
 use versa_scan_core::ports::driven::fetch::SampleFetcherPort;
 use versa_scan_core::ports::driven::self_update::SelfUpdatePort;
-use versa_scan_core::ports::driving::scan_pipeline::ScanPipelinePort;
 use versa_scan_core::services::Orchestrator;
 use versa_scan_infra::config::Configuration;
 use versa_scan_infra::outbound_adapters::fetch::HttpFetcher;
@@ -209,7 +208,18 @@ async fn run_sandbox(
     // to finish its final flush (configurable; the final flush itself is
     // cancellation-aware and requeues instead of scanning new batches).
     let grace = Duration::from_secs(config.shutdown_grace_secs());
-    let _ = tokio::time::timeout(grace, pipeline_task).await;
+    match tokio::time::timeout(grace, pipeline_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join)) => {
+            tracing::error!(error = %join, "pipeline task ended with a panic");
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "shutdown grace expired; exiting with unsettled work (broker will redeliver)"
+            );
+        }
+    }
     tracing::info!("vsd stopped");
     Ok(())
 }

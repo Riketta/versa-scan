@@ -119,12 +119,16 @@ impl DefenderScanner {
              (Get-MpComputerStatus).AntivirusSignatureVersion",
         ]);
         command.creation_flags_cfg();
-        let mut child = command.spawn().ok()?;
+        let Ok(mut child) = command.spawn() else {
+            tracing::debug!("Get-MpComputerStatus spawn failed; profile omits versions");
+            return None;
+        };
         // A hung PowerShell must not wedge the pipeline (profile() runs on
         // the scan path); kill and degrade to a version-less profile.
         let status = match tokio::time::timeout(STATUS_TIMEOUT, child.wait()).await {
             Ok(Ok(status)) => status,
             _ => {
+                tracing::debug!("Get-MpComputerStatus timed out; profile omits versions");
                 let _ = child.kill().await;
                 return None;
             }
@@ -135,6 +139,10 @@ impl DefenderScanner {
             let _ = stdout.read_to_string(&mut text).await;
         }
         if !status.success() {
+            tracing::debug!(
+                exit = status.code(),
+                "Get-MpComputerStatus failed; profile omits versions"
+            );
             return None;
         }
         let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
@@ -225,6 +233,7 @@ impl ScannerPort for DefenderScanner {
         };
         let dir_str = dir.to_string_lossy().to_string();
         let timeout = SPAWN_TIMEOUT + SCAN_OVERHEAD + self.scan_budget;
+        tracing::debug!(dir = %dir_str, "defender scan started");
         let output =
             Self::run_mpcmdrun(&exe, &["-Scan", "-ScanType", "3", "-File", &dir_str], timeout)
                 .await?;
@@ -232,6 +241,12 @@ impl ScannerPort for DefenderScanner {
         let code = output.status.code().unwrap_or(-1);
 
         let mut parsed = Self::parse_scan_output(&stdout);
+        tracing::debug!(
+            dir = %dir_str,
+            exit = code,
+            findings = parsed.len(),
+            "defender scan finished"
+        );
         match code {
             0 | 2 => {}
             other => {

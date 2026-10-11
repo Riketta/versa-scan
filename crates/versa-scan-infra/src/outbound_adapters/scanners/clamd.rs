@@ -185,6 +185,13 @@ impl ScannerPort for ClamdScanner {
         let mut files: Vec<PathBuf> = Vec::new();
         super::collect_files_recursive(dir, &mut files);
         files.sort();
+        tracing::debug!(
+            dir = %dir.display(),
+            files = files.len(),
+            concurrent = self.concurrent_scans,
+            "clamd scan started"
+        );
+        let started = std::time::Instant::now();
 
         // Parallel INSTREAM: every future owns its file name, so results
         // can never be zip-mis-attributed (a previous bug class here).
@@ -210,6 +217,11 @@ impl ScannerPort for ClamdScanner {
         for entry in entries {
             verdicts.push(entry?);
         }
+        tracing::debug!(
+            files = verdicts.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "clamd scan finished"
+        );
         Ok(ScanOutput { entries: verdicts })
     }
 

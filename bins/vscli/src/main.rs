@@ -216,7 +216,16 @@ async fn submit(
         let store = Arc::clone(store);
         let bind = bind.to_owned();
         let token = config.artifact_token();
-        tokio::spawn(async move { server::serve(store, &bind, &token).await })
+        tokio::spawn(async move {
+            let result = server::serve(store, &bind, &token).await;
+            // Covers the bind failure (also surfaced right after spawn) and
+            // a mid-session death - which would otherwise only show up as
+            // mysterious missing reports at --wait timeout.
+            if let Err(err) = &result {
+                tracing::error!(error = %err, bind = %bind, "artifact server exited");
+            }
+            result
+        })
     };
     // Wait a beat for the bind outcome: an unbindable port used to surface
     // much later as inexplicable "no report" timeouts.

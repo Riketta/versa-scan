@@ -18,12 +18,11 @@ use versa_scan_core::models::priority::Priority;
 use versa_scan_core::models::report::ScanReport;
 use versa_scan_core::models::sample::{ReportDest, SampleRequest};
 use versa_scan_core::models::verdict::ScanOutcome;
-use versa_scan_core::models::worker::WorkerInfo;
 use versa_scan_core::ports::driven::request_publisher::{PublishError, RequestPublisherPort};
 
 use crate::reports_log::ReportsLog;
 use crate::store::SampleStore;
-use versa_scan_infra::inbound_adapters::reports::{ReportStream, ReportWaiter};
+use versa_scan_infra::inbound_adapters::reports::ReportWaiter;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -168,7 +167,14 @@ impl Session {
                 }
                 let incoming = match tokio::time::timeout(remaining, stream.next()).await {
                     Err(_elapsed) => break, // deadline hit
-                    Ok(None) => break,      // stream closed
+                    Ok(None) => {
+                        tracing::warn!(
+                            received = outcomes.len(),
+                            expected = expected.len(),
+                            "report stream closed before every report arrived"
+                        );
+                        break;
+                    }
                     Ok(Some(Err(err))) => {
                         tracing::warn!(error = %err, "report stream error; continuing");
                         continue;
@@ -177,7 +183,15 @@ impl Session {
                 };
                 let report = incoming.report;
                 if let Some(log) = log {
-                    log.append(&report)?;
+                    // Persistence is best-effort: a jsonl io error must not
+                    // abort report collection (the table is the product).
+                    if let Err(err) = log.append(&report) {
+                        tracing::warn!(
+                            error = %err,
+                            sample_id = %report.sample_id,
+                            "failed to persist report to the local log; continuing"
+                        );
+                    }
                 }
                 let key = (report.sample_id.clone(), report.scanner.as_str().to_owned());
                 if expected.contains(&key) {
@@ -216,7 +230,12 @@ impl Session {
         }
     }
 
-    fn build_request(&self, sample: &Pending, scanner: &str, priority: &Priority) -> SampleRequest {
+    fn build_request(
+        &self,
+        sample: &Pending,
+        _scanner: &str,
+        priority: &Priority,
+    ) -> SampleRequest {
         SampleRequest {
             sample_id: sample.sample_id.clone(),
             url: self.sample_url(&sample.sha256),
@@ -291,7 +310,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use versa_scan_core::models::Detection;
     use versa_scan_core::models::ScanOutcome;
-    use versa_scan_core::models::worker::WorkerRole;
+    use versa_scan_core::models::worker::{WorkerInfo, WorkerRole};
     use versa_scan_core::ports::driven::ReportPublisherPort;
     use versa_scan_core::ports::driving::scan_pipeline::{
         Delivery, ScanPipelinePort as PipelinePort,
@@ -299,7 +318,7 @@ mod tests {
     use versa_scan_infra::inbound_adapters::ListenerError;
     use versa_scan_infra::inbound_adapters::bus::in_memory::pair;
     use versa_scan_infra::inbound_adapters::reports::{
-        BoxReportStream, IncomingReport, ReportItem,
+        BoxReportStream, IncomingReport, ReportItem, ReportStream,
     };
     use versa_scan_infra::outbound_adapters::bus::in_memory::InMemoryPublisher;
 
