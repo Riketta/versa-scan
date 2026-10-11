@@ -36,15 +36,19 @@ jobs:
             -p 5672:5672 \
             -e RABBITMQ_DEFAULT_USER=versa -e RABBITMQ_DEFAULT_PASS=versa \
             rabbitmq:3.13
-          for i in $(seq 1 60); do
-            if docker exec rabbitmq rabbitmq-diagnostics -q ping > /dev/null 2>&1; then
+          # Wait on the boot log, not `docker exec rabbitmq-diagnostics`:
+          # an exec before prelaunch generates the Erlang cookie makes
+          # diagnostics (running as root) create it root-owned, and the real
+          # boot then dies with ".erlang.cookie: eacces".
+          for i in $(seq 1 90); do
+            if docker logs rabbitmq 2>&1 | grep -q "Server startup complete"; then
               break
             fi
-            if [ "$i" -eq 60 ]; then
+            if [ "$i" -eq 90 ]; then
               docker logs rabbitmq
               exit 1
             fi
-            sleep 1
+            sleep 2
           done
 
           docker run -d --name nats \
