@@ -1,5 +1,8 @@
 # CI for versa-scan: fmt -> clippy -> tests on both target OSes, then
-# broker-backed integration tests on Linux (docker-compose services).
+# broker-backed integration tests on Linux. Brokers run as plain containers
+# started in Linux-only steps: service containers are Linux-only (a services
+# block would kill the Windows leg) and cannot pass server args (NATS
+# JetStream needs `-js`).
 
 name: ci
 
@@ -21,27 +24,29 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    services:
-      # Broker integration tests (crates/versa-scan-infra/tests/brokers.rs)
-      # run only where these env vars are set - Linux. Windows skips them.
-      # NATS is started as a plain container in a step instead of a service:
-      # service containers cannot pass server args (JetStream needs `-js`).
-      rabbitmq:
-        image: rabbitmq:3.13
-        env:
-          RABBITMQ_DEFAULT_USER: versa
-          RABBITMQ_DEFAULT_PASS: versa
-        ports:
-          - 5672:5672
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start NATS with JetStream
+      # Broker integration tests (crates/versa-scan-infra/tests/brokers.rs)
+      # run only where these brokers are up - Linux. Windows skips them.
+      - name: Start brokers (RabbitMQ + NATS)
         if: runner.os == 'Linux'
         run: |
+          docker run -d --name rabbitmq \
+            -p 5672:5672 \
+            -e RABBITMQ_DEFAULT_USER=versa -e RABBITMQ_DEFAULT_PASS=versa \
+            rabbitmq:3.13
+          for i in $(seq 1 60); do
+            if docker exec rabbitmq rabbitmq-diagnostics -q ping > /dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              docker logs rabbitmq
+              exit 1
+            fi
+            sleep 1
+          done
+
           docker run -d --name nats \
             -p 4222:4222 -p 8222:8222 \
             nats:2.11 -js -m 8222
@@ -63,8 +68,8 @@ jobs:
       - name: Clippy (deny-level lints gate)
         run: cargo +1.98 clippy --all-targets --locked
 
-      # Broker integration tests: service containers are Linux-only, so the
-      # env (which opts the tests in) must not be set on the Windows leg.
+      # Broker integration tests: the env opts the tests in and is only set
+      # on the Linux leg (where the brokers above are running).
       - name: Tests (broker integration, Linux)
         if: runner.os == 'Linux'
         env:
