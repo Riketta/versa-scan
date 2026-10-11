@@ -1,6 +1,6 @@
-//! vscli - the versa-scan CLI (composition root #2). Replaces the old
-//! backend/frontend for now: submits samples, serves them to workers over
-//! an embedded artifact server, and (with `--wait`) collects reports.
+//! vscli - the versa-scan CLI (composition root #2): submits samples,
+//! serves them to workers over an embedded artifact server, and (with
+//! `--wait`) collects reports.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

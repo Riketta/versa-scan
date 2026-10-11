@@ -1,4 +1,4 @@
-//! Worker self-update adapter (the C# Updater, redesigned).
+//! Worker self-update adapter.
 //!
 //! Contract: an HTTP base URL serves `manifest.txt` (`<semver>;<sha256 of
 //! zip>`) and `<semver>.zip` archives containing the new binaries. `check`

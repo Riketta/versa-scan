@@ -33,7 +33,7 @@ struct Cli {
     /// Lower the default log filter to debug.
     #[arg(long)]
     debug: bool,
-    /// Probe every known scanner and exit (replaces the C# reflection scan).
+    /// Probe every known scanner and exit.
     #[arg(long)]
     detect: bool,
     #[command(subcommand)]

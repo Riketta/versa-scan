@@ -1,7 +1,6 @@
-//! Dispatch priority. Three bands instead of the C# system's raw 0-100 byte:
-//! the only consumers of priority are the RabbitMQ adapter (native
-//! `x-max-priority`) and batch preemption logic. NATS ignores priority by
-//! design decision (see docs/DESIGN.md).
+//! Dispatch priority. Three bands: the only consumers of priority are the
+//! RabbitMQ adapter (native `x-max-priority`) and batch preemption logic.
+//! NATS ignores priority by design decision (see docs/DESIGN.md).
 
 use std::fmt;
 

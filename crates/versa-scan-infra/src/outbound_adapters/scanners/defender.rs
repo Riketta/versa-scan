@@ -1,5 +1,4 @@
-//! Windows Defender scanner via `MpCmdRun.exe` (the real implementation of
-//! the C# system's empty stub).
+//! Windows Defender scanner via `MpCmdRun.exe`.
 //!
 //! - Executable resolution: newest `Windows Defender\Platform\<ver>` first,
 //!   then `Program Files\Windows Defender\MpCmdRun.exe`.

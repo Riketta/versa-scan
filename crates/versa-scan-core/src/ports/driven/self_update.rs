@@ -1,5 +1,4 @@
-//! Worker self-update port (the C# Updater, redesigned): manifest check +
-//! hash-verified staged swap.
+//! Worker self-update port: manifest check + hash-verified staged swap.
 
 use async_trait::async_trait;
 

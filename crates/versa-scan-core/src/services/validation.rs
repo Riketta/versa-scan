@@ -1,9 +1,8 @@
 //! Validation: reconciles a scanner's report against the files that were
 //! actually placed in the batch workspace. Pure.
 //!
-//! The C# system flagged count mismatches as errors in the log only; here a
-//! missing per-file verdict is synthesized into an explicit error outcome so
-//! the requester always gets exactly one report per sample.
+//! A missing per-file verdict is synthesized into an explicit error outcome
+//! so the requester always gets exactly one report per sample.
 
 use crate::models::batch::BatchFile;
 use crate::models::verdict::FileVerdict;

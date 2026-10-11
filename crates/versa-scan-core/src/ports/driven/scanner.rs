@@ -1,4 +1,4 @@
-//! The antivirus port - the C# `Antivirus` abstract class, cleaned up.
+//! The antivirus port: install probe, profile snapshot, scan, update.
 
 use std::path::Path;
 

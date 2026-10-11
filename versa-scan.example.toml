@@ -15,7 +15,7 @@
 
 # Root directory for batch workspaces (fetched samples + reports state).
 # Cleaned automatically; swept of leftovers at startup.
-workspace_root = "vl_tasks"
+workspace_root = "workspaces"
 
 # Batching: how many samples per scanner run, and how long an under-filled
 # batch waits for more requests before flushing (milliseconds).

@@ -1,5 +1,5 @@
-//! Core services: the pipeline's brain, extracted from the C# worker's
-//! entangled loops into pure, unit-tested components plus one orchestrator.
+//! Core services: pure, unit-tested pipeline components plus one
+//! orchestrator wiring them together.
 
 pub mod orchestrator;
 pub mod planner;

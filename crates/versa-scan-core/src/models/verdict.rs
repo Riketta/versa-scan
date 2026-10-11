@@ -1,5 +1,5 @@
-//! Scan verdicts - the typed replacement for the C# report's bool soup
-//! (`infected` / `av_error` / `proc_pass` / `proc_corr` / `proc_trust`).
+//! Scan verdicts - a typed enum covering detection, clean, skip, and error
+//! outcomes with structured reasons.
 
 use std::collections::BTreeSet;
 

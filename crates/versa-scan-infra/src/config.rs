@@ -59,7 +59,7 @@ impl Default for WorkerConfig {
         Self {
             role: None,
             scanner: None,
-            workspace_root: PathBuf::from("vl_tasks"),
+            workspace_root: PathBuf::from("workspaces"),
             files_per_batch: 10,
             batch_idle_timeout_ms: 250,
             scan_timeout_secs: 15 * 60,

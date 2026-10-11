@@ -1,13 +1,12 @@
 # versa-scan
 
-The Rust re-implementation of the VirusLocal Worker: a distributed
-sample-scanning system. One worker (`vsd`) runs per antivirus, on its own
-VM; samples are dispatched over a message bus (RabbitMQ or NATS JetStream);
-per-sample scan reports go back to the requester. `vscli` is the
-operator-facing CLI - it stores samples in a local content-addressed store,
-serves them to workers over an embedded HTTP artifact server, publishes
-scan requests, and (with `--wait`) collects and prints the reports. It
-replaces the old backend/frontend.
+A distributed sample-scanning system. One worker (`vsd`) runs per scanner,
+typically on its own VM; samples are dispatched over a message bus
+(RabbitMQ or NATS JetStream); per-sample scan reports go back to the
+requester. `vscli` is the operator-facing CLI: it stores samples in a
+local content-addressed store, serves them to workers over an embedded
+HTTP artifact server, publishes scan requests, and (with `--wait`)
+collects and prints the reports.
 
 Hexagonal architecture (ports & adapters): `versa-scan-core` holds the
 domain (models, ports, the scan pipeline's brain) and never depends on
@@ -28,13 +27,25 @@ which bus adapter are wired, both chosen at the composition roots.
         └── vscli submit --wait prints a per-scanner result table
 ```
 
-## Status
+## Features
 
-All milestones (M0-M5) are implemented: core pipeline, RabbitMQ + NATS bus
-adapters, worker (clamd/YARA-X/hash-blocklist/Defender/debug scanners, HTTP
-fetcher), CLI (store, artifact server, submit --wait), self-updater,
-openbox role, README/Dockerfile/CI. Broker integration tests run on Linux
-CI (they need docker services); everything else runs on both OSes.
+- **Scanners**: ClamAV (clamd TCP), YARA-X (embedded engine), sha256
+  hash blocklists, Windows Defender, and a deterministic `debug` scanner
+  for demos and tests. New sources arrive as `ScannerPort` adapters.
+- **Two real buses**: RabbitMQ (native priority queues) and NATS
+  JetStream (dedupe, work-queue semantics); an in-memory pair backs the
+  unit-speed tests.
+- **Delivery guarantees**: publish-then-ack ordering, bounded retries for
+  every failure class, explicit error reports on terminal failure -
+  nothing is silently dropped and nothing loops forever.
+- **Operator CLI**: content-addressed sample store, embedded artifact
+  server (token auth, range requests), fan-out to every scanner,
+  report table with `--wait`.
+- **Ops**: hash-verified self-updater, autostart installation
+  (Task Scheduler / systemd), openbox role for scanner DB + worker
+  updates, single TOML config with env overrides.
+- **Cross-platform**: Windows-first (the AV world) with first-class
+  Linux support; broker integration tests run on Linux CI.
 
 ## Layout
 
@@ -44,7 +55,7 @@ crates/
 └── versa-scan-infra/   # adapters:
     ├── inbound_adapters/   # driving: bus listeners, report waiters
     ├── outbound_adapters/  # driven: bus publishers, scanners, fetch,
-    │                       #   scheduler, self-update
+    │                       #   self-update
     └── wire.rs             # bus DTOs (schema 1) + topology naming
 bins/
 ├── vsd/                # worker daemon (sandbox + openbox roles)
@@ -53,10 +64,32 @@ bins/
 
 Dependency rule (compile-enforced): `infra → core` only; bins wire both.
 
+## Quick start
+
+Prerequisites: Rust (toolchain pinned in `rust-toolchain.toml`), Docker
+for the brokers.
+
+```bash
+# 1. Brokers (RabbitMQ + NATS + clamd) for local development:
+docker compose up -d
+
+# 2. A worker (debug scanner needs nothing installed):
+cp versa-scan.example.toml versa-scan.toml
+#    edit: worker.scanner, [bus] backend + url
+vsd
+
+# 3. Submit samples and wait for reports (another terminal):
+vscli submit --scanner debug --wait eicar.txt
+```
+
+The `debug` scanner produces deterministic verdicts from file names
+(`eicar` → detected, `locked` → password-protected skip, ...), so this
+round trip works with no antivirus installed.
+
 ## Build
 
-Toolchain is pinned in `rust-toolchain.toml` (1.98). The local gate IS the
-CI gate, in this order:
+Toolchain is pinned in `rust-toolchain.toml`. The local gate IS the CI
+gate, in this order:
 
 ```
 cargo fmt --all -- --check
@@ -101,7 +134,7 @@ or a systemd unit on Linux).
 
 Worker self-update: set `[self_update] enabled = true`, `url` to a server
 serving `manifest.txt` (`<semver>;<sha256-of-zip>`) and `<semver>.zip`.
-`vsd update check|apply` drive it manually.
+`vsd update-check` / `vsd update-apply` drive it manually.
 
 ## Submitting samples
 
@@ -109,7 +142,7 @@ serving `manifest.txt` (`<semver>;<sha256-of-zip>`) and `<semver>.zip`.
 # Serve the store persistently (optional; submit also runs one per session):
 vscli serve --bind 0.0.0.0:8080
 
-# Submit (hashes, stores, serves, publishes to both scanners, waits):
+# Submit (hashes, stores, serves, publishes to the scanners, waits):
 vscli submit suspicious1.exe suspicious2.dll --scanner all --wait
 vscli submit --scanner clamd --priority high --timeout 300 sample.bin \
     --bind 0.0.0.0:8080 --advertise http://10.0.0.5:8080
@@ -127,9 +160,6 @@ vscli reports <sample-id>
 - `--wait` prints a table (`sample / scanner / outcome`) and exits non-zero
   if any report is missing at the timeout. Reports are persisted to the
   store's `reports/reports.jsonl` regardless.
-- The `debug` scanner produces deterministic verdicts from file names
-  (`eicar` → detected, `locked` → password-protected skip, ...) for demos
-  and tests.
 
 ## Scanners
 
@@ -141,8 +171,13 @@ vscli reports <sample-id>
 | `defender` | Windows | `MpCmdRun.exe -Scan` + PowerShell status; `MpCmdRun -SignatureUpdate` for updates |
 | `debug` | any | deterministic fake for tests |
 
-Open/free scanner focus: commercial AVs from the C# system (KES, DrWeb,
-NOD32, ...) are out of scope - new sources arrive as `ScannerPort`
+Adding a scanner means implementing the `ScannerPort` trait
+(`crates/versa-scan-core/src/ports/driven/scanner.rs`) and registering the
+adapter at the composition root - see `docs/DESIGN.md` for the contract and
+`crates/versa-scan-infra/src/outbound_adapters/scanners/` for existing
+implementations. For hash-blocklist feeds, abuse.ch MalwareBazaar sha256
+exports work as-is. The `yara-x` example rule set lives in `examples/rules/`.
+
 ## Security model
 
 The bus is treated as untrusted input. Hardening in place:
@@ -165,10 +200,6 @@ The bus is treated as untrusted input. Hardening in place:
 - **Defender fails closed**: exit 2 with unparseable findings is a scan
   error, never a clean verdict.
 
-adapters (see `docs/DESIGN.md` for the adapter template). Useful next
-feeds: abuse.ch MalwareBazaar sha256 exports. The `yara-x` example rule
-set lives in `examples/rules/`.
-
 ## Wire contract
 
 JSON, versioned (`schema: 1`), defined in `crates/versa-scan-infra/src/wire.rs`:
@@ -183,15 +214,17 @@ JSON, versioned (`schema: 1`), defined in `crates/versa-scan-infra/src/wire.rs`:
   NATS, one session queue on RabbitMQ).
 
 Priority is honored natively by RabbitMQ (`x-max-priority`); NATS ignores
-it by design. Settlement semantics (ack/nak-requeue/discard, publish-then-
-ack) are documented in `docs/DESIGN.md` alongside the full blueprint and
-decision log.
+it by design. Settlement semantics (ack/nak-requeue/discard,
+publish-then-ack) are documented in `docs/DESIGN.md` alongside the full
+system design.
 
 ## Configuration
 
 Single TOML (`versa-scan.toml`, see `versa-scan.example.toml`) +
-`VERSA_SCAN_<SECTION>__<KEY>` env overrides. Loaded once at startup - no
-hot reload by design (worker connections are deployment-static).
+`VERSA_SCAN_<SECTION>__<KEY>` env overrides (double underscore separates
+nesting levels, e.g. `VERSA_SCAN_WORKER__SCANNER=clamd`). Loaded once at
+startup - no hot reload by design (worker connections are
+deployment-static).
 
 ## Development
 

@@ -1,15 +1,15 @@
 //! `BatchPlanner` - the pure state machine behind scan batching.
 //!
-//! This is the C# worker's `ProduceAvScanTaskLoop` decision tree, extracted:
+//! Decision tree:
 //! - Same-priority requests fill the open batch up to capacity.
 //! - A higher-priority request parks the open batch and opens a new one
 //!   (preemption); parked batches resurface when the planner is empty again.
 //! - A lower-priority request closes the open batch (it gets scanned now
 //!   rather than mixing priorities) and opens a new one.
 //! - A full batch is emitted as ready.
-//! - `flush` closes the open batch when the consumer goes idle - unlike the
-//!   C# loop, which closed a task the instant the queue drained (often
-//!   producing 1-file scans), the orchestrator gives it a grace period.
+//! - `flush` closes the open batch when the consumer goes idle - the
+//!   orchestrator gives it a grace period so an under-filled batch can
+//!   wait for more work instead of producing 1-file scans.
 //!
 //! Emits [`PlannerEvent`]s; the orchestrator turns each ready batch into a
 //! scan run. Pure and synchronous - all I/O lives elsewhere.

@@ -3,7 +3,7 @@
 
 use std::str::FromStr;
 
-/// Deployment role of a worker instance (the C# openbox/sandbox split).
+/// Deployment role of a worker instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkerRole {
     /// Scans samples from the bus.

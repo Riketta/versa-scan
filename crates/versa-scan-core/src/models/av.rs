@@ -1,6 +1,5 @@
-//! Scanner identity metadata (`AVInfo` in the C# system), snapshotted into
-//! every report so consumers can attribute verdicts to a specific scanner
-//! state.
+//! Scanner identity metadata, snapshotted into every report so consumers
+//! can attribute verdicts to a specific scanner state.
 
 use std::collections::BTreeMap;
 

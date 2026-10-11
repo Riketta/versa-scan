@@ -1,7 +1,8 @@
 //! The orchestrator: the pipeline brain behind [`ScanPipelinePort`].
 //! ingest -> plan -> fetch -> scan -> validate -> report -> settle, with
-//! guaranteed workspace cleanup and publish-then-ack ordering (the
-//! structural fix for the C# system's ack-before-publish loss window).
+//! guaranteed workspace cleanup and publish-then-ack ordering (acking
+//! before the report is confirmed published would open a message-loss
+//! window).
 //!
 //! Direction of dependencies: implements the DRIVING port
 //! (`ScanPipelinePort`) - an inbound bus listener feeds it deliveries - and

@@ -1,5 +1,5 @@
 //! Scanner registry: the composition-root table mapping scanner slugs to
-//! adapters (the Rust replacement for the C# reflection-based discovery).
+//! adapters.
 
 use std::sync::Arc;
 use std::time::Duration;

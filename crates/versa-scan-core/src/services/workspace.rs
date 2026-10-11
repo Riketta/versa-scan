@@ -1,10 +1,9 @@
 //! Batch workspaces: per-batch directories with guaranteed cleanup.
 //!
-//! Layout: `<root>/<batch_id>/files/<sample_id>`. Every workspace removes its
-//! directory on `Drop` (best-effort, logged) - the structural fix for the C#
-//! system's disk-fill bug, where task folders were cleaned only by a
-//! finalizer that also wrote `taskinfo.txt` into them. A `manifest.json`
-//! describing the batch is written when the workspace is created instead.
+//! Layout: `<root>/<batch_id>/files/<sample_id>`. A `manifest.json`
+//! describing the batch is written when the workspace is created, the
+//! directory is removed on `Drop` (best-effort, logged), and startup sweeps
+//! leftovers - no orphaned task folders, no disk fill.
 
 use std::path::{Path, PathBuf};
 

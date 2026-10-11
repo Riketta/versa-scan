@@ -2,8 +2,7 @@
 ///
 /// Contract: nothing is ever silently dropped. A failure either requeues the
 /// delivery (bounded by the attempt cap for its failure class) or produces a
-/// terminal error report back to the requester. This replaces the C# system's
-/// reject-twice-then-vanish behavior and its ack-before-publish loss window.
+/// terminal error report back to the requester.
 ///
 /// Scanner-unavailable failures get their own (usually larger) cap: an AV
 /// daemon restarting is an operational blip worth tolerating longer than a
